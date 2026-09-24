@@ -230,7 +230,7 @@ class Kernel {
 			throw error;
 		}
 	}
-	async run(code: string, context: ToolContext, timeoutMs: number): Promise<ToolOutput> {
+	async run(code: string, context: ToolContext, timeoutMs: number, fresh = false): Promise<ToolOutput> {
 		if (this.cell)
 			throw new ToolFailure(
 				"This language kernel is busy. Wait for its cell, or use reset to cancel it and discard state.",
@@ -268,11 +268,16 @@ class Kernel {
 			await Promise.allSettled([...cell.calls.values()].map((call) => call.settled));
 			let terminationConfirmed: boolean | undefined;
 			if (result.stateLost) terminationConfirmed = await this.stop(result.error ?? "Kernel exited.");
+			// A fresh kernel has nothing to preserve: never imply earlier cells' bindings still exist.
 			const status = result.stateLost
 				? "Kernel state lost."
-				: result.error
-					? "Kernel bindings preserved (including changes before the error)."
-					: "Kernel bindings preserved.";
+				: fresh
+					? result.error
+						? "Fresh kernel: bindings from this cell (before the error) persist for later cells."
+						: "Fresh kernel: bindings from this cell persist for later cells."
+					: result.error
+						? "Kernel bindings preserved (including changes before the error)."
+						: "Kernel bindings preserved.";
 			return {
 				text: `${cell.preview}${result.error ? `\n${result.error}\n` : ""}\n${status}${terminationConfirmed === false ? " WARNING: process-tree termination could not be confirmed." : ""}\nFull kernel output journal: ${this.artifact}${cell.outputBytes > Buffer.byteLength(cell.preview) ? " (cell output truncated above)" : ""}`,
 				isError: Boolean(result.error),
@@ -345,6 +350,7 @@ export function createEvalTools(environment: ToolEnvironment): {
 			let kernel = kernels.get(key);
 			const code = argOptionalString(args, "code");
 			let notice = "";
+			let fresh = false;
 			if (argBool(args, "reset", false)) {
 				if (kernel) {
 					const confirmed = await kernel.stop("Kernel explicitly reset; all bindings were discarded.");
@@ -401,11 +407,14 @@ export function createEvalTools(environment: ToolEnvironment): {
 						() => invoker,
 					);
 					kernels.set(key, kernel);
+					fresh = true;
+					if (!notice)
+						notice = `Started a fresh ${language} kernel: no bindings from earlier cells exist (first use here, or salam restarted since).\n`;
 				} finally {
 					starting.delete(key);
 				}
 			}
-			const result = await kernel.run(code, context, argInt(args, "timeout", 60, 1, 3600) * 1000);
+			const result = await kernel.run(code, context, argInt(args, "timeout", 60, 1, 3600) * 1000, fresh);
 			return { ...result, text: notice + result.text };
 		},
 	});

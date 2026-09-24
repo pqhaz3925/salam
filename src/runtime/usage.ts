@@ -1,6 +1,6 @@
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { resolveUsedFraction } from "@oh-my-pi/pi-ai/usage";
-import type { ModelChoice, ProviderUsage } from "../contracts.ts";
+import type { ModelChoice, ProviderUsage, QuotaView, QuotaWindow } from "../contracts.ts";
 import type { AuxUsageRecord, StoredEntry } from "./store.ts";
 
 export interface UsageSource {
@@ -65,7 +65,7 @@ export function formatSessionUsage(sources: readonly UsageSource[]): string {
 	return [
 		"Session usage — recorded requests, including child agents",
 		...rows,
-		`Total: ${number(total.requests)} requests (${auxiliary} auxiliary: recap/compaction/web fetch/web search), ${number(total.tokens)} tokens`,
+		`Total: ${number(total.requests)} requests (${auxiliary} auxiliary: recap/compaction/title/web fetch/web search), ${number(total.tokens)} tokens`,
 		`Input uncached: ${number(total.input)} · output: ${number(total.output)}`,
 		`Cache read: ${number(total.cacheRead)} · cache write: ${number(total.cacheWrite)} · prompt cache hit: ${hit}`,
 		...(total.reasoning > 0
@@ -76,6 +76,55 @@ export function formatSessionUsage(sources: readonly UsageSource[]): string {
 			: "Cost estimate: unavailable or unpriced; this does not imply unlimited/free quota.",
 		"Provider quota is account-wide, not this session's token total. Requests whose provider supplies no usage cannot be counted.",
 	].join("\n");
+}
+
+const HOUR_MS = 3_600_000;
+/** Footer windows, shortest first: Claude/Codex 5h + week, Devin day + week. */
+const QUOTA_WINDOWS = [
+	{ label: "5h", ids: ["5h"], durationMs: 5 * HOUR_MS },
+	{ label: "day", ids: ["1d", "24h", "daily"], durationMs: 24 * HOUR_MS },
+	{ label: "week", ids: ["7d", "1w", "weekly"], durationMs: 7 * 24 * HOUR_MS },
+] as const;
+
+/**
+ * The footer's view of a quota report for one model: the 5-hour, daily and
+ * weekly windows that bind it, each as the tightest remaining fraction among
+ * the account-wide rows and the rows scoped to this model's tier (Claude's
+ * Opus/Sonnet weekly caps, Codex Spark). Other windows (monthly credits,
+ * extra usage) and rows for other tiers are left to `/usage`. Undefined when
+ * the report has none of these windows.
+ */
+export function quotaView(usage: ProviderUsage, model: string): QuotaView | undefined {
+	const report = usage.report;
+	if (!report) return undefined;
+	const id = model.toLowerCase();
+	const windows: QuotaWindow[] = [];
+	for (const kind of QUOTA_WINDOWS) {
+		let best: QuotaWindow | undefined;
+		for (const limit of report.limits) {
+			const tier = limit.scope.tier?.toLowerCase();
+			if (tier && !id.includes(tier)) continue;
+			const windowId = (limit.window?.id ?? limit.scope.windowId ?? "").toLowerCase();
+			const duration = limit.window?.durationMs;
+			const matches =
+				duration !== undefined && Number.isFinite(duration)
+					? Math.abs(duration - kind.durationMs) < HOUR_MS / 2
+					: (kind.ids as readonly string[]).includes(windowId);
+			if (!matches) continue;
+			const used = resolveUsedFraction(limit);
+			if (used === undefined || !Number.isFinite(used)) continue;
+			const remaining = Math.min(1, Math.max(0, 1 - used));
+			if (best && best.remaining <= remaining) continue;
+			const resetsAt = limit.window?.resetsAt;
+			best = {
+				label: kind.label,
+				remaining,
+				...(resetsAt !== undefined && Number.isFinite(resetsAt) ? { resetsAt } : {}),
+			};
+		}
+		if (best) windows.push(best);
+	}
+	return windows.length ? { provider: usage.provider, windows, fetchedAt: usage.fetchedAt } : undefined;
 }
 
 export function formatProviderUsage(usage: ProviderUsage): string {

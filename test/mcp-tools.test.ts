@@ -5,8 +5,8 @@ import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { Arguments, Json, McpServerConfig, ToolContext, ToolOutput } from "../src/contracts.ts";
 import { absolutizePlaywrightLinks } from "../src/integrations/content.ts";
-import { createMcpTools } from "../src/integrations/mcp-tools.ts";
 import { McpHub } from "../src/integrations/mcp.ts";
+import { createMcpTools } from "../src/integrations/mcp-tools.ts";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6EJAAAAAASUVORK5CYII=";
 const DESCRIPTION = `Inspect a value. ${"Extended guidance. ".repeat(30)}\n\nUse negative values to request the error result.`;
@@ -139,7 +139,7 @@ async function fixture(options: { duplicate?: boolean; implementation?: string; 
 	};
 	// The configured key deliberately does not identify the implementation.
 	config.mcpServers = { browser: stdio };
-	if (options.duplicate) config.mcpServers["second"] = stdio;
+	if (options.duplicate) config.mcpServers.second = stdio;
 	if (options.http) {
 		const http = Bun.serve({
 			port: 0,
@@ -169,7 +169,7 @@ async function fixture(options: { duplicate?: boolean; implementation?: string; 
 		cleanup.push(async () => {
 			await http.stop(true);
 		});
-		config.mcpServers["remote"] = { url: `http://127.0.0.1:${http.port}/mcp` };
+		config.mcpServers.remote = { url: `http://127.0.0.1:${http.port}/mcp` };
 	}
 	const hub = await McpHub.create(config);
 	cleanup.push(() => hub.close());
@@ -374,6 +374,6 @@ test("artifact conversion leaves code, page links, URLs, missing paths and unrel
 		{ base: directory, artifactRoots: [artifacts], since: Date.now() },
 	);
 	expect(result.rewritten).toBe(1);
-	expect(result.blocks[0]?.["text"]).toBe(`${untouched}\n- [Snapshot](${resolve(artifacts, "page.yml")})`);
+	expect(result.blocks[0]?.text).toBe(`${untouched}\n- [Snapshot](${resolve(artifacts, "page.yml")})`);
 	expect(result.blocks[1]).toEqual({ type: "image", data: PNG, mimeType: "image/png" });
 });

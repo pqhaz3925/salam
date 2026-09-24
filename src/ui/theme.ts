@@ -1,5 +1,5 @@
-import { SyntaxStyle, bold as boldChunk, dim as dimChunk, fg, italic as italicChunk } from "@opentui/core";
 import type { TextChunk } from "@opentui/core";
+import { bold as boldChunk, dim as dimChunk, fg, italic as italicChunk, SyntaxStyle } from "@opentui/core";
 
 /** Unstyled chunk: inherits the terminal's own foreground colour. */
 export function plain(text: string): TextChunk {
@@ -7,31 +7,37 @@ export function plain(text: string): TextChunk {
 }
 
 /**
- * Restrained palette for dark terminals: readable muted-gray body text, cyan
- * accents, green for completed actions and amber for work in progress. The
- * background is never painted, so the transcript stays on the terminal's own
- * near-black canvas with no cards or panels.
+ * Claude Code-like palette for dark terminals: near-white body text, grey for
+ * secondary detail, green/red for results and diffs, and one warm accent for
+ * live activity. The transcript background is never painted, except the user's
+ * own messages and diff lines, which get a subtle tint as in Claude Code.
  */
 export const palette = {
 	accent: "#5fb3c3",
 	accentSoft: "#4a8d9b",
-	user: "#d3d7dc",
-	text: "#bfc3c8",
-	thinking: "#7b8087",
-	muted: "#8b9096",
-	faint: "#62676d",
-	rule: "#367f8b",
+	/** Live activity (spinner and status), Claude Code's warm orange. */
+	active: "#d77757",
+	user: "#f2f2f2",
+	userBg: "#373737",
+	text: "#e4e4e4",
+	thinking: "#8c8c8c",
+	muted: "#9a9a9a",
+	faint: "#6e6e6e",
+	rule: "#505050",
 	ok: "#6fbf73",
 	warn: "#d4a24c",
-	error: "#d7675e",
-	added: "#6fb070",
-	removed: "#cf6a62",
+	error: "#e0685e",
+	added: "#8fd694",
+	removed: "#f08a82",
+	addedBg: "#1f3d27",
+	removedBg: "#4d2629",
 	code: "#a3c49a",
 	link: "#7aa7d4",
 } as const;
 
 export const accent = fg(palette.accent);
 export const accentSoft = fg(palette.accentSoft);
+export const active = fg(palette.active);
 export const user = fg(palette.user);
 export const text = fg(palette.text);
 export const thinking = fg(palette.thinking);
@@ -48,13 +54,14 @@ export const italic = italicChunk;
 /** Glyphs. Plain box-drawing / geometric characters only, never emoji. */
 export const glyph = {
 	user: ">",
+	prompt: "\u276f",
 	tool: "\u25cf",
 	toolRunning: "\u25cb",
 	bullet: "\u00b7",
 	rule: "\u2500",
 	sep: "\u00b7",
 	divider: "\u2502",
-	branch: "\u2514",
+	branch: "\u23bf",
 	branchMid: "\u251c",
 	ellipsis: "\u2026",
 	caret: "\u203a",
@@ -66,17 +73,18 @@ export const glyph = {
 	todoAbandoned: "\u2013",
 } as const;
 
+/** Claude Code's glyph spinner: a star that grows and shrinks. */
 export const spinnerFrames = [
-	"\u280b",
-	"\u2819",
-	"\u2839",
-	"\u2838",
-	"\u283c",
-	"\u2834",
-	"\u2826",
-	"\u2827",
-	"\u2807",
-	"\u280f",
+	"\u00b7",
+	"\u2722",
+	"\u2733",
+	"\u2736",
+	"\u273b",
+	"\u273d",
+	"\u273b",
+	"\u2736",
+	"\u2733",
+	"\u2722",
 ] as const;
 
 /**

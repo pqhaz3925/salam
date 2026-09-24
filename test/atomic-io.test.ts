@@ -1,3 +1,4 @@
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { chmodSync, closeSync, openSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import {
@@ -17,17 +18,16 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { ToolContext } from "../src/contracts.ts";
-import { createFileOperationTools } from "../src/tools/file-ops.ts";
-import { FreshnessTracker, type ToolEnvironment, Workspace } from "../src/tools/workspace.ts";
 import { atomicRename } from "../src/tools/atomic-rename.ts";
 import { type ExecOptions, type ExecResult, LocalExecutor } from "../src/tools/exec.ts";
-import { LocalFs, observeMutations, readTextFile, RemoteFs } from "../src/tools/fs.ts";
+import { createFileOperationTools } from "../src/tools/file-ops.ts";
+import { LocalFs, observeMutations, RemoteFs, readTextFile } from "../src/tools/fs.ts";
 import { REMOTE_ATOMIC_SOURCE } from "../src/tools/remote-atomic.ts";
 import { REMOTE_HELPER_SOURCE } from "../src/tools/remote-helper.ts";
 import type { RemoteExecutor } from "../src/tools/ssh.ts";
 import { sha256Hex, shellQuote, ToolFailure } from "../src/tools/util.ts";
+import { FreshnessTracker, type ToolEnvironment, Workspace } from "../src/tools/workspace.ts";
 
 let root = "";
 let sandbox = "";

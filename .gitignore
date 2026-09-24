@@ -5,3 +5,7 @@ dist/
 .env
 .env.*
 !.env.example
+.salam-recovery-*/
+.DS_Store
+coverage/
+*.tsbuildinfo

@@ -1,11 +1,11 @@
+import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { fetchCodexModels } from "@oh-my-pi/pi-catalog/discovery/codex";
 import { fetchDevinModels } from "@oh-my-pi/pi-catalog/discovery/devin";
-import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { ModelChoice, ProviderProfile, SalamConfig } from "../contracts";
-import type { Credential } from "./auth";
 import { expandHeaders } from "../integrations/env";
+import type { Credential } from "./auth";
 
 export function profileFor(config: SalamConfig, name: string): ProviderProfile {
 	const profile = config.providers[name];

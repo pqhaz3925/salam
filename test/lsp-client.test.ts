@@ -1,6 +1,6 @@
+import { expect, test } from "bun:test";
 import { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
-import { expect, test } from "bun:test";
 import { LspClient } from "../src/tools/lsp/client.ts";
 import { pathToUri } from "../src/tools/lsp/manager.ts";
 

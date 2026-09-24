@@ -301,7 +301,7 @@ async function callPrompt(hub: McpHub, args: Arguments, context: ToolContext): P
 			`prompt '${name}'`,
 		);
 	}
-	const raw = args["arguments"];
+	const raw = args.arguments;
 	const promptArguments: Record<string, string> = {};
 	if (raw !== undefined) {
 		if (typeof raw !== "object" || raw === null || Array.isArray(raw))
@@ -329,6 +329,20 @@ async function callPrompt(hub: McpHub, args: Arguments, context: ToolContext): P
 	};
 }
 
+/** Waits for background startup connections, so listings and ownership lookups see every server. */
+async function startupSettled(hub: McpHub, signal?: AbortSignal): Promise<void> {
+	if (!signal) return hub.settled();
+	signal.throwIfAborted();
+	const { promise, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(signal.reason);
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		await Promise.race([hub.settled(), promise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
 export function createMcpTools(hub: McpHub): HarnessTool[] {
 	return [
 		{
@@ -346,8 +360,10 @@ export function createMcpTools(hub: McpHub): HarnessTool[] {
 				offset: { type: "integer", minimum: 0, description: "Zero-based page offset (default 0)." },
 				limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size (default 50, max 100)." },
 			}),
-			async execute(args: Arguments): Promise<ToolOutput> {
+			async execute(args: Arguments, context?: ToolContext): Promise<ToolOutput> {
 				try {
+					// Server status stays immediately inspectable while a slow server is still starting.
+					if (stringArgument(args, "kind") !== "servers") await startupSettled(hub, context?.signal);
 					return await listOutput(hub, args);
 				} catch (error) {
 					return failureOutput(error, "discovery");
@@ -377,6 +393,7 @@ export function createMcpTools(hub: McpHub): HarnessTool[] {
 			}),
 			async execute(args: Arguments, context: ToolContext): Promise<ToolOutput> {
 				try {
+					await startupSettled(hub, context.signal);
 					const action = stringArgument(args, "action") ?? "tool";
 					if (action === "resource") return await callResource(hub, args, context);
 					if (action === "prompt") return await callPrompt(hub, args, context);
@@ -400,7 +417,7 @@ export function createMcpTools(hub: McpHub): HarnessTool[] {
 								.map((entry) => entry.server),
 							`tool '${tool}'`,
 						);
-					const payload = args["arguments"];
+					const payload = args.arguments;
 					if (
 						payload !== undefined &&
 						(typeof payload !== "object" || payload === null || Array.isArray(payload))

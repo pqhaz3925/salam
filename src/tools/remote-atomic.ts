@@ -1,6 +1,6 @@
 /** Executed only on the selected SSH target; Python 3's standard library supplies the syscall bridge. */
 export const REMOTE_ATOMIC_SOURCE = String.raw`
-import ctypes, errno, hashlib, json, os, shutil, signal, stat, sys, time
+import ctypes, errno, hashlib, json, os, re, shutil, signal, stat, sys, time
 
 cancelled = False
 RECOVERY_CAPACITY = 1024
@@ -124,7 +124,7 @@ def private_root(path, device):
     for index, part in enumerate(parts):
         parent = os.lstat(current)
         if not stat.S_ISDIR(parent.st_mode) or parent.st_uid not in (uid, 0) or (parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
-            raise RuntimeError("Recovery ancestor permits unsafe ownership or pathname substitution: " + repr(current))
+            raise RuntimeError("Recovery ancestor permits unsafe ownership or pathname substitution: " + repr(current) + " (owner uid " + str(parent.st_uid) + ", mode " + format(parent.st_mode & 0o7777, "04o") + "; needs owner uid " + str(uid) + " or root and no group/other write unless sticky). Fix: chmod go-w " + current)
         current = os.path.join(current, part)
         try:
             os.mkdir(current, 0o700)
@@ -145,6 +145,26 @@ def private_root(path, device):
         os.close(fd)
         raise
 
+def repository_directory(worktree):
+    try:
+        directory = os.path.join(worktree, ".git")
+        if not os.path.isdir(directory):
+            with open(directory) as pointer:
+                match = re.search(r"^gitdir:\s*(.+?)\s*$", pointer.read(), re.M)
+            if not match:
+                return None
+            directory = os.path.join(worktree, match.group(1))
+        common = os.path.join(directory, "commondir")
+        if os.path.exists(common):
+            with open(common) as handle:
+                shared = handle.read().strip()
+            if shared:
+                directory = os.path.join(directory, shared)
+        directory = os.path.realpath(directory)
+        return directory if os.path.isdir(directory) else None
+    except Exception:
+        return None
+
 def recovery(path, operation, digest):
     parent = os.path.realpath(os.path.dirname(path) or ".")
     device = os.lstat(parent).st_dev
@@ -155,20 +175,26 @@ def recovery(path, operation, digest):
         if within(parent, workspace):
             boundaries.append(workspace)
     mount = ancestor = parent
+    git_directories = []
     while True:
         if os.path.lexists(os.path.join(ancestor, ".git")):
             boundaries.append(ancestor)
+            git_directory = repository_directory(ancestor)
+            if git_directory:
+                git_directories.append(git_directory)
         above = os.path.dirname(ancestor)
         if above == ancestor or os.lstat(above).st_dev != device:
             break
         mount = ancestor = above
     home = os.path.realpath(os.path.expanduser("~"))
     cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(home, "Library/Caches" if sys.platform == "darwin" else ".cache")
-    candidates = [os.path.join(cache, "salam", "recovery"), os.path.join(mount, ".salam-recovery-" + str(os.getuid()))]
+    uid = os.getuid()
+    candidates = [(os.path.join(cache, "salam", "recovery"), False), (os.path.join(mount, ".salam-recovery-" + str(uid)), False)]
+    candidates += [(os.path.join(directory, "salam-recovery-" + str(uid)), True) for directory in git_directories]
     refused = []
-    for root in candidates:
+    for root, git in candidates:
         root = os.path.normpath(root)
-        if not os.path.isabs(root) or any(within(root, boundary) for boundary in boundaries):
+        if not os.path.isabs(root) or (not git and any(within(root, boundary) for boundary in boundaries)):
             refused.append(root + ": inside the working tree")
             continue
         try:
@@ -180,7 +206,15 @@ def recovery(path, operation, digest):
         except Exception as error:
             refused.append(root + ": " + str(error))
             continue
-        fd = private_root(root, device)
+        existed = os.path.lexists(root)
+        try:
+            fd = private_root(root, device)
+        except Exception as error:
+            # Only an unsafe existing root is evidence of substitution; an uncreatable one is just unusable.
+            if existed:
+                raise
+            refused.append(root + ": " + str(error))
+            continue
         try:
             entries = set(os.listdir(root))
             for slot in range(RECOVERY_CAPACITY):
@@ -210,7 +244,7 @@ def recovery(path, operation, digest):
             raise MutationFailure("Recovery capacity reached (" + str(RECOVERY_CAPACITY) + " retained operations) at " + root + ". No new staging was created. Inspect and manually remove only entries whose editor descriptors are closed and whose data is no longer needed; salam never prunes displaced inodes automatically.", "unpublished", [root])
         finally:
             os.close(fd)
-    raise RuntimeError("No safe owner-private same-filesystem recovery location exists outside the working tree. " + "; ".join(refused))
+    raise RuntimeError("No safe owner-private same-filesystem recovery location exists outside the working tree. " + "; ".join(refused) + ". Fix: create one as root, e.g. sudo install -d -o " + str(uid) + " -m 700 " + os.path.join(mount, ".salam-recovery-" + str(uid)) + ", or work inside a Git repository on this filesystem")
 
 def discard_staging(directory):
     if directory is None:

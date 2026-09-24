@@ -92,7 +92,7 @@ test("Python persistent async globals invoke real file tools and reject recursiv
 
 test("timed out JS cells report state loss and bounded Unicode output remains recoverable", async () => {
 	const { environment, tool, context } = await setup();
-	const text = "a".repeat(8191) + "𝄞" + "b".repeat(80_000);
+	const text = `${"a".repeat(8191)}𝄞${"b".repeat(80_000)}`;
 	const output = await tool.execute(
 		{ language: "js", code: `console.log(${JSON.stringify(text)})` },
 		context,

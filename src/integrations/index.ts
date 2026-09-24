@@ -24,6 +24,9 @@ export async function createIntegrations(config: SalamConfig): Promise<Integrati
 
 	return {
 		tools,
+		ready(): Promise<void> {
+			return hub.settled();
+		},
 		async instructions(cwd: string): Promise<string[]> {
 			return instructions.load(cwd);
 		},

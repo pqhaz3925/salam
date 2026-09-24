@@ -1,7 +1,7 @@
+import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
 import type { SalamConfig } from "../src/contracts.ts";
 import { InstructionLoader } from "../src/integrations/instructions.ts";
 import type { McpHub } from "../src/integrations/mcp.ts";

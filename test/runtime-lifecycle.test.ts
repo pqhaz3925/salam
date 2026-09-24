@@ -1,8 +1,9 @@
+import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { expect, test } from "bun:test";
+import type { AssistantMessage, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai";
+import { loadConfig } from "../src/config.ts";
 import type {
 	AppController,
 	AppSnapshot,
@@ -61,6 +62,8 @@ async function fixture(
 		tools?: HarnessTool[];
 		interactive?: boolean;
 		maxAgents?: number;
+		contextWindow?: number;
+		usage?: Usage;
 		bridge?: (
 			invoke: (name: string, args: Record<string, unknown>, context: ToolContext) => Promise<ToolOutput>,
 		) => void;
@@ -70,7 +73,7 @@ async function fixture(
 	const config: SalamConfig = {
 		home: join(root, "home"),
 		cwd: join(root, "workspace"),
-		selection: { provider: "fixture", model: "default", contextWindow: 128000 },
+		selection: { provider: "fixture", model: "default", contextWindow: options.contextWindow ?? 128000 },
 		webSearchModel: { provider: "fixture", model: "default" },
 		providers: {
 			fixture: {
@@ -117,7 +120,7 @@ async function fixture(
 					model: request.selection.model,
 					stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop",
 					timestamp: Date.now(),
-					usage: {
+					usage: options.usage ?? {
 						input: 1,
 						output: 1,
 						cacheRead: 0,
@@ -182,6 +185,111 @@ async function fixture(
 		},
 	};
 }
+
+test("a resumed million-token model continues past 120k without truncating cached history", async () => {
+	const f = await fixture(
+		(_request, _main, turn) => say(turn === 1 ? "Keep the original decision" : "Continued"),
+		{
+			contextWindow: 1_000_000,
+			usage: {
+				input: 2480,
+				output: 1,
+				cacheRead: 121520,
+				cacheWrite: 0,
+				totalTokens: 124001,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		},
+	);
+	try {
+		f.config.contextThreshold = (
+			await loadConfig({ cwd: f.config.cwd, home: f.config.home })
+		).contextThreshold;
+		await f.controller.submit("Retain this requirement");
+		const sessionId = f.controller.snapshot().sessionId;
+		await f.reopen();
+		expect(f.controller.snapshot().contextTokens).toBe(124001);
+		expect(f.controller.snapshot().contextLimit).toBe(1_000_000);
+		await f.controller.submit("Continue the same task");
+		expect(f.controller.snapshot().sessionId).toBe(sessionId);
+		expect(f.controller.snapshot().status).not.toBe("Error");
+		expect(f.requests).toHaveLength(2);
+		const history = f.requests[1]!.entries;
+		expect(
+			history.some(
+				(entry) =>
+					entry.kind === "message" &&
+					entry.message.role === "user" &&
+					entry.message.content === "Retain this requirement",
+			),
+		).toBe(true);
+		expect(
+			history.some(
+				(entry) =>
+					entry.kind === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.content.some(
+						(block) => block.type === "text" && block.text === "Keep the original decision",
+					),
+			),
+		).toBe(true);
+		expect(history.some((entry) => entry.kind === "compaction")).toBe(false);
+	} finally {
+		await f.close();
+	}
+});
+
+test("an explicit context cap still stops a model with a larger window", async () => {
+	const f = await fixture(() => say("Current response"), {
+		contextWindow: 1_000_000,
+		usage: {
+			input: 123999,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 124000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	});
+	try {
+		await writeFile(join(f.config.home, "config.json"), JSON.stringify({ contextThreshold: 120000 }));
+		f.config.contextThreshold = (
+			await loadConfig({ cwd: f.config.cwd, home: f.config.home })
+		).contextThreshold;
+		await f.controller.submit("First request");
+		await f.controller.submit("Do not exceed the configured cap");
+		expect(f.requests).toHaveLength(1);
+		expect(f.controller.snapshot().status).toBe("Error");
+	} finally {
+		await f.close();
+	}
+});
+
+test("an oversized configured cap cannot consume the model's response reserve", async () => {
+	const f = await fixture(() => say("Current response"), {
+		contextWindow: 32000,
+		usage: {
+			input: 30999,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 31000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	});
+	try {
+		await writeFile(join(f.config.home, "config.json"), JSON.stringify({ contextThreshold: 1_000_000 }));
+		f.config.contextThreshold = (
+			await loadConfig({ cwd: f.config.cwd, home: f.config.home })
+		).contextThreshold;
+		await f.controller.submit("First request");
+		await f.controller.submit("Leave room for the requested response");
+		expect(f.requests).toHaveLength(1);
+		expect(f.controller.snapshot().status).toBe("Error");
+	} finally {
+		await f.close();
+	}
+});
 
 test("modern MCP schemas validate tuple arguments before any tool side effect", async () => {
 	const f = await fixture(

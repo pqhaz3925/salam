@@ -1,7 +1,7 @@
+import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { SalamConfig, ToolContext, ToolOutput } from "../src/contracts.ts";
 import { createLspTools, type LspSuite } from "../src/tools/lsp/tools.ts";
 import { ToolEnvironment } from "../src/tools/workspace.ts";

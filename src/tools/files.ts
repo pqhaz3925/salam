@@ -3,6 +3,8 @@ import { extname, posix } from "node:path";
 import type { Arguments, HarnessTool, Json, ToolContext, ToolOutput } from "../contracts.ts";
 import { type FileStat, readTextFile, type WorkspaceFs } from "./fs.ts";
 import { commitEditPlan, type EditPlan } from "./lsp/transaction.ts";
+import { isStructuredFile, readStructuredFile } from "./reader-formats.ts";
+import { countLines, LINE_COUNT_LIMIT, readTextPage } from "./reader-text.ts";
 import { joinText, splitText, unifiedDiff } from "./text.ts";
 import {
 	argBool,
@@ -14,8 +16,6 @@ import {
 	ToolFailure,
 } from "./util.ts";
 import { defineTool, displayPath, type ToolEnvironment, type Workspace } from "./workspace.ts";
-import { readTextPage } from "./reader-text.ts";
-import { isStructuredFile, readStructuredFile } from "./reader-formats.ts";
 
 const IMAGE_READ_LIMIT = 5 * 1024 * 1024;
 const EDIT_SIZE_LIMIT = 8 * 1024 * 1024;
@@ -431,7 +431,17 @@ export function createFileTools(environment: ToolEnvironment): HarnessTool[] {
 				);
 			}
 
-			const header = `${target.shown} — ${page.totalLines === undefined ? "streamed text" : `${page.totalLines} lines`}, ${formatBytes(target.stat.size)}`;
+			// A paged read still states the file's length, so nobody needs `wc -l` first.
+			const totalLines =
+				page.totalLines ??
+				(target.stat.size <= LINE_COUNT_LIMIT
+					? await countLines(target.workspace.fs, target.path, context.signal)
+					: undefined);
+			const shown =
+				page.truncated && page.shownLines > 0
+					? `; showing lines ${page.offset}-${page.offset + page.shownLines - 1}`
+					: "";
+			const header = `${target.shown} — ${totalLines === undefined ? "streamed text" : `${totalLines} lines`}, ${formatBytes(target.stat.size)}${shown}`;
 			return {
 				text: `${header}\n${page.text}`,
 				details: {
@@ -440,7 +450,7 @@ export function createFileTools(environment: ToolEnvironment): HarnessTool[] {
 					kind: "file",
 					size: target.stat.size,
 					hash: target.stat.hash ?? null,
-					...(page.totalLines === undefined ? {} : { totalLines: page.totalLines }),
+					...(totalLines === undefined ? {} : { totalLines }),
 					offset: page.offset,
 					column: page.column,
 					shownLines: page.shownLines,
@@ -888,4 +898,30 @@ export function createFileTools(environment: ToolEnvironment): HarnessTool[] {
 	});
 
 	return [read, list, write, edit, batchEdit];
+}
+
+/**
+ * Image viewing without the rest of `read`, for restricted tool sets whose text reading goes
+ * through the shell: the shell can only return text, so this is what shows the model a picture.
+ */
+export function createViewImageTool(read: HarnessTool): HarnessTool {
+	const extensions = Object.keys(IMAGE_MIME_BY_EXTENSION);
+	return {
+		name: "view_image",
+		description: `Show an image file to you as real image content (${extensions.join(", ")}), such as a screenshot or diagram.`,
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Image path, absolute or relative to the working directory." },
+			},
+			required: ["path"],
+			additionalProperties: false,
+		},
+		async execute(args, context): Promise<ToolOutput> {
+			const path = typeof args.path === "string" ? args.path : "";
+			if (!IMAGE_MIME_BY_EXTENSION[extname(path).toLowerCase()])
+				return { text: `view_image only shows ${extensions.join(", ")} files.`, isError: true };
+			return read.execute({ path }, context);
+		},
+	};
 }

@@ -3,15 +3,16 @@ import { constants } from "node:fs";
 import {
 	chmod,
 	copyFile,
+	type FileHandle,
 	lstat,
 	mkdir,
 	open,
 	readdir,
+	readFile,
 	realpath,
 	rm,
 	unlink,
 	writeFile,
-	type FileHandle,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -41,7 +42,7 @@ interface Rollback {
 
 // An entry-count bound is intentional: live descriptors can grow retained inodes
 // at any time, so neither an age sweep nor a nominal byte quota makes deletion safe.
-const RECOVERY_CAPACITY = 1024;
+export const RECOVERY_CAPACITY = 1024;
 const UNPUBLISHED_RENAME_CODES: Record<string, true> = {
 	EACCES: true,
 	EEXIST: true,
@@ -176,7 +177,7 @@ async function privateRoot(path: string, device: number): Promise<FileHandle> {
 			((parent.mode & 0o022) !== 0 && (parent.mode & 0o1000) === 0)
 		)
 			throw new ToolFailure(
-				`Recovery ancestor ${current} permits unsafe ownership or pathname substitution.`,
+				`Recovery ancestor ${current} permits unsafe ownership or pathname substitution (owner uid ${parent.uid}, mode ${(parent.mode & 0o7777).toString(8).padStart(4, "0")}; needs owner uid ${uid} or root and no group/other write unless sticky). Fix: chmod go-w ${current}${process.platform === "darwin" ? `, and if the volume ignores ownership, sudo diskutil enableOwnership <volume>` : ""}.`,
 			);
 		current = join(current, part);
 		try {
@@ -219,10 +220,15 @@ async function recovery(path: string, operation: string, expectedHash: string | 
 	const cwd = await realpath(process.cwd());
 	if (within(parent, cwd)) boundaries.push(cwd);
 	let mount = parent;
+	// Git metadata is on the repository's filesystem but outside the working tree: the last-resort
+	// recovery location when a volume's root is not writable (external disks, shared mounts).
+	const gitDirectories: string[] = [];
 	for (let ancestor = parent; ; ancestor = dirname(ancestor)) {
 		try {
-			await lstat(join(ancestor, ".git"));
+			const marker = await lstat(join(ancestor, ".git"));
 			boundaries.push(ancestor);
+			const gitDirectory = await repositoryDirectory(ancestor, marker.isDirectory());
+			if (gitDirectory) gitDirectories.push(gitDirectory);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
@@ -234,10 +240,15 @@ async function recovery(path: string, operation: string, expectedHash: string | 
 	const home = await realpath(homedir());
 	const cache =
 		process.env.XDG_CACHE_HOME || join(home, process.platform === "darwin" ? "Library/Caches" : ".cache");
-	const candidates = [join(cache, "salam", "recovery"), join(mount, `.salam-recovery-${process.getuid!()}`)];
+	const uid = process.getuid!();
+	const candidates = [
+		{ root: join(cache, "salam", "recovery"), git: false },
+		{ root: join(mount, `.salam-recovery-${uid}`), git: false },
+		...gitDirectories.map((directory) => ({ root: join(directory, `salam-recovery-${uid}`), git: true })),
+	];
 	const refused: string[] = [];
-	for (const root of candidates) {
-		if (!isAbsolute(root) || boundaries.some((boundary) => within(root, boundary))) {
+	for (const { root, git } of candidates) {
+		if (!isAbsolute(root) || (!git && boundaries.some((boundary) => within(root, boundary)))) {
 			refused.push(`${root}: inside the working tree`);
 			continue;
 		}
@@ -257,9 +268,24 @@ async function recovery(path: string, operation: string, expectedHash: string | 
 			refused.push(`${root}: ${errorText(error)}`);
 			continue;
 		}
-		// An unsafe existing same-device cache is a hard refusal, not a reason to
-		// silently choose another location and hide evidence of substitution.
-		const handle = await privateRoot(root, device);
+		let existed = true;
+		try {
+			await lstat(root);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			existed = false;
+		}
+		// An unsafe existing same-device root is a hard refusal, not a reason to silently
+		// choose another location and hide evidence of substitution. A root that does not
+		// exist yet and cannot be created safely (e.g. a root-owned volume) just is not usable.
+		let handle: FileHandle;
+		try {
+			handle = await privateRoot(root, device);
+		} catch (error) {
+			if (existed) throw error;
+			refused.push(`${root}: ${errorText(error)}`);
+			continue;
+		}
 		try {
 			const entries = new Set(await readdir(root));
 			for (let slot = 0; slot < RECOVERY_CAPACITY; slot++) {
@@ -279,14 +305,14 @@ async function recovery(path: string, operation: string, expectedHash: string | 
 				try {
 					await writeFile(
 						join(directory, "manifest.json"),
-						JSON.stringify({
+						`${JSON.stringify({
 							path: resolve(path),
 							operation,
 							expectedHash,
 							createdAt: new Date().toISOString(),
 							retention:
 								"Retained inodes may still have open writers. No automatic pruning; inspect before manual removal.",
-						}) + "\n",
+						})}\n`,
 						{ flag: "wx", mode: 0o600 },
 					);
 					return directory;
@@ -296,7 +322,7 @@ async function recovery(path: string, operation: string, expectedHash: string | 
 				}
 			}
 			throw new ToolFailure(
-				`Recovery capacity reached (${RECOVERY_CAPACITY} retained operations) at ${root}. No new staging was created. Inspect and manually remove only recovery entries whose editor descriptors are closed and whose data is no longer needed; salam never prunes displaced inodes automatically.`,
+				`Recovery capacity reached (${RECOVERY_CAPACITY} retained operations) at ${root}. No new staging was created. Inspect and manually remove only recovery entries whose editor descriptors are closed and whose data is no longer needed ("salam recovery" lists them; "salam recovery prune" removes those no process holds open); salam never prunes displaced inodes automatically.`,
 				{ recoveryPaths: [root] },
 			);
 		} finally {
@@ -304,8 +330,33 @@ async function recovery(path: string, operation: string, expectedHash: string | 
 		}
 	}
 	throw new ToolFailure(
-		`No safe owner-private same-filesystem recovery location exists outside the working tree. ${refused.join("; ")}. Nothing was published.`,
+		`No safe owner-private same-filesystem recovery location exists outside the working tree. ${refused.join("; ")}. Fix: create one as root, e.g. sudo install -d -o ${uid} -m 700 ${join(mount, `.salam-recovery-${uid}`)}, or work inside a Git repository on this filesystem. Nothing was published.`,
 	);
+}
+
+/** The Git directory for a `.git` directory or `gitdir:` file, shared across worktrees; undefined if unreadable. */
+export async function repositoryDirectory(
+	worktree: string,
+	isDirectory: boolean,
+): Promise<string | undefined> {
+	try {
+		let directory = join(worktree, ".git");
+		if (!isDirectory) {
+			const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(directory, "utf8"))?.[1];
+			if (!pointer) return undefined;
+			directory = resolve(worktree, pointer);
+		}
+		try {
+			const common = (await readFile(join(directory, "commondir"), "utf8")).trim();
+			if (common) directory = resolve(directory, common);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		const real = await realpath(directory);
+		return (await lstat(real)).isDirectory() ? real : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function recoveryPaths(error: unknown): string[] {
@@ -660,6 +711,7 @@ export async function chmodGuarded(
 		try {
 			await file?.close();
 		} catch (error) {
+			// biome-ignore lint/correctness/noUnsafeFinally: a failed close after chmod leaves publication uncertain, which must outrank any result.
 			throw failure(path, error, [], changed ? "unknown" : "unpublished");
 		}
 	}

@@ -1,11 +1,11 @@
+import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { convertMessages as convertOpenAIMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type { AssistantMessage, ImageContent, Message, Model, Usage } from "@oh-my-pi/pi-ai";
+import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { convertMessages as convertOpenAIMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { HistoryEntry, ModelChoice, ProviderRequest, SalamConfig } from "../src/contracts.ts";
 import { anthropicStream, contextFor } from "../src/providers/anthropic.ts";
 import { createProviderGateway } from "../src/providers/index.ts";

@@ -1,9 +1,9 @@
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
-import { getOAuthApiKey, refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthProvider } from "@oh-my-pi/pi-ai/oauth";
+import { getOAuthApiKey, refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
+import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import type { ProviderProfile, SalamConfig } from "../contracts";
 
 type StoredCredential =

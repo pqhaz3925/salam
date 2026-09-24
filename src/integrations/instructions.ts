@@ -188,7 +188,7 @@ export class InstructionLoader {
 		for (const line of lines) {
 			if (FENCE.test(line)) fenced = !fenced;
 			const match = fenced ? null : IMPORT_LINE.exec(line);
-			if (!match || !match[1]) {
+			if (!match?.[1]) {
 				out.push(line);
 				continue;
 			}

@@ -5,6 +5,7 @@ import type { Message, Usage } from "@oh-my-pi/pi-ai";
 import type {
 	AgentView,
 	HistoryEntry,
+	ImageAttachment,
 	Json,
 	ModelChoice,
 	ModelContext,
@@ -13,8 +14,8 @@ import type {
 	SalamConfig,
 	SessionGoal,
 	SessionInfo,
-	ToolSpec,
 	TodoItem,
+	ToolSpec,
 } from "../contracts.ts";
 import {
 	auxUsageSchema,
@@ -30,6 +31,8 @@ import {
 export interface SessionRecord {
 	id: string;
 	title: string;
+	/** "user": set with /title and never replaced; "generated": named by the model. Absent: first message. */
+	titleSource?: "user" | "generated";
 	cwd: string;
 	localCwd?: string;
 	selection: ModelChoice;
@@ -80,6 +83,7 @@ export interface InboxMessage {
 	id: number;
 	sender: string;
 	text: string;
+	images: string | null;
 }
 export interface WorktreeRecord {
 	id: string;
@@ -146,13 +150,21 @@ export interface FileMutation extends FileMutationInput {
  * accounting, so they are billed to the session separately.
  */
 export interface AuxUsageRecord {
-	kind: "recap" | "compaction" | "web_fetch" | "web_search";
+	kind: "recap" | "compaction" | "web_fetch" | "web_search" | "title";
 	usage: Usage;
 	selection: ModelChoice;
 	timestamp: number;
 }
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
+
+/** v4: queued user messages may carry pasted images (JSON `ImageAttachment[]`). */
+function migrateInboxImages(db: Database): void {
+	const columns = db.query<{ name: string }, []>("PRAGMA table_info(inbox)").all();
+	if (!columns.some((column) => column.name === "images"))
+		db.exec("ALTER TABLE inbox ADD COLUMN images TEXT");
+	db.exec("PRAGMA user_version=4");
+}
 
 const SCHEMA_V1 = `
   CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_id TEXT, updated_at INTEGER NOT NULL, data TEXT NOT NULL);
@@ -274,6 +286,8 @@ const INTERRUPTED_LABEL = "(no text)";
  * by session id or `main`, so it cannot collide with real mail.
  */
 const STEERING = "user (steering)";
+/** Mail from a background-command watch, delivered under its own header. */
+export const WATCH_SENDER = "command_watch";
 
 function messageText(message: Message): string {
 	if (typeof message.content === "string") return message.content;
@@ -361,6 +375,7 @@ export class Store {
 				if (version < 1) this.db.exec(SCHEMA_V1);
 				if (version < 2) this.db.exec(SCHEMA_V2);
 				if (version < 3) migrateModelContexts(this.db);
+				if (version < 4) migrateInboxImages(this.db);
 			})();
 	}
 	save(session: SessionRecord): void {
@@ -470,8 +485,10 @@ export class Store {
 		}
 		return found;
 	}
-	send(id: string, sender: string, text: string): void {
-		this.db.query("INSERT INTO inbox(session_id,sender,text) VALUES(?,?,?)").run(id, sender, text);
+	send(id: string, sender: string, text: string, images?: readonly ImageAttachment[]): void {
+		this.db
+			.query("INSERT INTO inbox(session_id,sender,text,images) VALUES(?,?,?,?)")
+			.run(id, sender, text, images?.length ? JSON.stringify(images) : null);
 	}
 	/** Called only inside the transaction that persists a completion's delivery. */
 	private takeInbox(id: string, sender: string): boolean {
@@ -554,8 +571,8 @@ export class Store {
 					.get(id, sender) !== null;
 	}
 	/** Queues a user message for the session's next request boundary. */
-	steer(id: string, text: string): void {
-		this.send(id, STEERING, text);
+	steer(id: string, text: string, images?: readonly ImageAttachment[]): void {
+		this.send(id, STEERING, text, images);
 	}
 	/** Queued user messages not yet delivered, oldest first. */
 	steering(id: string): string[] {
@@ -595,12 +612,12 @@ export class Store {
 			const messages = steering
 				? this.db
 						.query<InboxMessage, [string]>(
-							"SELECT id,sender,text FROM inbox WHERE session_id=? AND delivered=0 ORDER BY id",
+							"SELECT id,sender,text,images FROM inbox WHERE session_id=? AND delivered=0 ORDER BY id",
 						)
 						.all(session.id)
 				: this.db
 						.query<InboxMessage, [string, string]>(
-							"SELECT id,sender,text FROM inbox WHERE session_id=? AND delivered=0 AND sender<>? ORDER BY id",
+							"SELECT id,sender,text,images FROM inbox WHERE session_id=? AND delivered=0 AND sender<>? ORDER BY id",
 						)
 						.all(session.id, STEERING);
 			if (!messages.length) return [];
@@ -616,12 +633,29 @@ export class Store {
 					kind: "message",
 					message:
 						message.sender === STEERING
-							? { role: "user", content: message.text, timestamp: Date.now() }
+							? {
+									role: "user",
+									content: message.images
+										? [
+												{ type: "text" as const, text: message.text },
+												...(JSON.parse(message.images) as ImageAttachment[]).map((image) => ({
+													type: "image" as const,
+													data: image.data,
+													mimeType: image.mimeType,
+												})),
+											]
+										: message.text,
+									timestamp: Date.now(),
+								}
 							: {
 									role: "user",
 									synthetic: true,
 									attribution: "agent",
-									content: `[Agent message from ${message.sender}]\n${message.text}`,
+									// Watch events carry their own `[command_watch]` header: they are not from an agent.
+									content:
+										message.sender === WATCH_SENDER
+											? message.text
+											: `[Agent message from ${message.sender}]\n${message.text}`,
 									timestamp: Date.now(),
 								},
 				};

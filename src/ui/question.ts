@@ -1,8 +1,8 @@
-import { StyledText } from "@opentui/core";
 import type { TextChunk } from "@opentui/core";
+import { StyledText } from "@opentui/core";
 import type { UserQuestion } from "../contracts.ts";
-import { accent, bold, faint, glyph, muted, plain, text, user } from "./theme.ts";
 import { flatten, truncate, wrapText } from "./text.ts";
+import { accent, bold, faint, glyph, muted, plain, text, user } from "./theme.ts";
 
 /** Keyboard state for the question being answered: focused option and, for multi-select, the ticked ones. */
 export interface QuestionCursor {

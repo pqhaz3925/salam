@@ -71,8 +71,11 @@ salam --resume ID                       # A unique ID prefix also works
 salam sessions
 salam models
 salam auth
+salam recovery                          # Retained file-recovery entries (see below)
 salam --help
 ```
+
+File writes are atomic and keep the file they replace (the displaced inode, which another editor may still have open) in an owner-private recovery directory outside the working tree: the user cache, a volume's `.salam-recovery-UID`, or the repository's `.git/salam-recovery-UID`. Nothing is pruned automatically, and writes are refused once a directory holds 1024 entries. `salam recovery` lists them (marking any a process still has open); `salam recovery prune entry-N ...` or `salam recovery prune --older-than 14d` removes them, skipping open ones unless `--force`.
 
 Interactive mode requires a terminal. Use `-p` for non-interactive execution; `--json` requires `-p`. Slash commands also work in one-shot mode, for example:
 
@@ -164,6 +167,8 @@ A minimal configuration:
   "autoMemoryEnabled": true
 }
 ```
+
+Leave `contextThreshold` unset to use the active model's context window automatically, reserving `maxOutputTokens` plus a 4,096-token safety margin. An explicit `contextThreshold` adds an absolute token cap; it cannot exceed that model-aware budget. Cached tokens still occupy context space even when the provider reuses them.
 
 See [configuration loading and validation](src/config.ts) and [configuration types](src/contracts.ts) for the complete contract.
 
@@ -263,7 +268,10 @@ Project memory is separate from per-session context notes and conversation histo
 ```sh
 bun install --frozen-lockfile
 bun run check
-bun test
+bun run test          # full suite, test files in 5 parallel workers (~35s), on the pinned Bun (a bare `bun test` may pick an older global Bun and is refused)
+bun run test:serial   # the same suite in one process (~110s), for debugging cross-file interference
+bun run test:fast     # parallel, skipping the slow process-supervisor and eval-kernel suites
+bun run lint          # Biome lint + format check (clean; `bun run format` fixes formatting)
 bun run build
 bun run format
 ```
@@ -288,3 +296,9 @@ This is a Bun bundle with external dependencies, **not a standalone executable**
 | [`test/`](test/) | Regression and integration tests |
 
 For bugs, include reproduction steps and relevant output in an [issue](https://github.com/pqhaz3925/salam/issues). Redact credentials and private project data.
+
+## License
+
+Copyright (C) 2026 Pavel Mikhailovin.
+
+salam is free software licensed under the [GNU Affero General Public License v3.0](LICENSE). If you modify it and make it available to users over a network, you must also offer them the corresponding source code.

@@ -1,6 +1,31 @@
 import type { WorkspaceFs } from "./fs.ts";
 import { ToolFailure } from "./util.ts";
 
+/** Files up to this size get an exact line count even when only one page is shown. */
+export const LINE_COUNT_LIMIT = 16 * 1024 * 1024;
+
+/**
+ * Newline-terminated line count of a whole file (a final unterminated line
+ * counts), scanning raw bytes in large chunks: UTF-8 never uses 0x0A inside a
+ * multi-byte sequence, so no decoding is needed. Remote files cost one round
+ * trip per MiB.
+ */
+export async function countLines(fs: WorkspaceFs, path: string, signal: AbortSignal): Promise<number> {
+	let lines = 0;
+	let offset = 0;
+	let last = -1;
+	for (;;) {
+		signal.throwIfAborted();
+		const chunk = await fs.readBytes(path, 1024 * 1024, signal, offset);
+		const bytes = chunk.bytes;
+		for (let index = bytes.indexOf(10); index !== -1; index = bytes.indexOf(10, index + 1)) lines++;
+		if (bytes.length) last = bytes[bytes.length - 1]!;
+		offset += bytes.length;
+		if (!chunk.truncated || !bytes.length) break;
+	}
+	return offset > 0 && last !== 10 ? lines + 1 : lines;
+}
+
 /** Scan bounded chunks, discarding the prefix rather than retaining it in memory. */
 export async function readTextPage(
 	fs: WorkspaceFs,

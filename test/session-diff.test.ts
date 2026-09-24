@@ -1,7 +1,7 @@
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { Arguments, ToolContext, ToolOutput } from "../src/contracts.ts";
 import { createSessionDiffTool } from "../src/runtime/changes.ts";
 import { FileCheckpoints } from "../src/runtime/checkpoints.ts";

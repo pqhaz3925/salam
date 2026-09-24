@@ -1,12 +1,12 @@
-import { StyledText } from "@opentui/core";
 import type { SelectOption, TextChunk } from "@opentui/core";
+import { StyledText } from "@opentui/core";
 import { For, Show } from "solid-js";
 import type { AgentView } from "../contracts.ts";
+import { modelTag } from "./blocks.tsx";
 import type { SlashCommand } from "./commands.ts";
 import { StyledLine } from "./styled.tsx";
-import { accent, bold, danger, faint, glyph, muted, ok, palette, plain, warn } from "./theme.ts";
 import { flatten, truncate } from "./text.ts";
-import { modelTag } from "./blocks.tsx";
+import { accent, bold, danger, faint, glyph, muted, ok, palette, plain, warn } from "./theme.ts";
 
 /** Command palette rows: one terminal row per command, selected row accented. */
 export function buildSuggestionText(

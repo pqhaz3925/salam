@@ -1,7 +1,7 @@
+import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
 import { loadConfig } from "../src/config.ts";
 import { createProviderGateway } from "../src/providers/index.ts";
 import { createWebTool } from "../src/tools/web.ts";

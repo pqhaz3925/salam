@@ -1,7 +1,7 @@
 import { AsyncResource } from "node:async_hooks";
 import type { Arguments, HarnessTool, ToolContext, ToolOutput } from "../../contracts.ts";
 import { readTextFile } from "../fs.ts";
-import { searchPage, SEARCH_PAGE_PROPERTIES } from "../search.ts";
+import { SEARCH_PAGE_PROPERTIES, searchPage } from "../search.ts";
 import { splitText, unifiedDiff } from "../text.ts";
 import { argInt, argOptionalString, argString, randomToken, sha256Hex, ToolFailure } from "../util.ts";
 import { defineTool, displayPath, type ToolEnvironment, type Workspace } from "../workspace.ts";
@@ -21,9 +21,9 @@ import {
 	type WorkspaceEdit,
 } from "./client.ts";
 import {
-	languageIdForPath,
 	LspManager,
 	type LspSession,
+	languageIdForPath,
 	MAX_DOCUMENT_BYTES,
 	type OpenedDocument,
 	pathToUri,
@@ -516,7 +516,10 @@ export function createLspTools(environment: ToolEnvironment): LspSuite {
 			try {
 				const { session } = await manager.session(context, path, cache);
 				let group = groups.get(session);
-				if (!group) groups.set(session, (group = []));
+				if (!group) {
+					group = [];
+					groups.set(session, group);
+				}
 				group.push(path);
 			} catch (error) {
 				context.signal.throwIfAborted();
@@ -627,7 +630,10 @@ export function createLspTools(environment: ToolEnvironment): LspSuite {
 			if (record.status !== "unsupported") continue;
 			const reason = record.reason;
 			let paths = unsupportedByReason.get(reason);
-			if (!paths) unsupportedByReason.set(reason, (paths = []));
+			if (!paths) {
+				paths = [];
+				unsupportedByReason.set(reason, paths);
+			}
 			paths.push(record.path);
 		}
 		const unsupportedCount = ordered.length - checked - unready.length - failed.length;

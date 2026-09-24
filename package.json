@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "description": "A local-first coding harness with subscription providers and remote tools",
+  "license": "AGPL-3.0-only",
+  "author": "Pavel Mikhailovin <pqhaz3925@proton.me>",
   "homepage": "https://github.com/pqhaz3925/salam#readme",
   "repository": {
     "type": "git",
@@ -21,9 +23,12 @@
   "scripts": {
     "start": "bun --preload @opentui/solid/preload src/cli.ts",
     "check": "tsc --noEmit",
-    "test": "bun test",
+    "test": "bun test --parallel=5",
+    "test:serial": "bun test",
+    "test:fast": "bun test --parallel=5 --path-ignore-patterns='test/processes.test.ts' --path-ignore-patterns='test/eval.test.ts'",
     "build": "bun scripts/build.ts",
-    "format": "biome format --write src scripts test"
+    "format": "biome format --write src scripts test",
+    "lint": "biome check src scripts test"
   },
   "engines": {
     "bun": ">=1.4.1"
@@ -50,7 +55,8 @@
     "tree-sitter-python": "0.25.0",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
-    "typescript-language-server": "6.0.0"
+    "typescript-language-server": "6.0.0",
+    "web-tree-sitter": "0.25.10"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

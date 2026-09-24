@@ -1,7 +1,13 @@
 import { dirname } from "node:path";
 import type { ToolContext } from "../contracts.ts";
 import { mutationPublication } from "../tools/atomic-io.ts";
-import type { FsMutation, FsMutationObserver, WorkspaceFs } from "../tools/fs.ts";
+import type {
+	ExternalChange,
+	ExternalState,
+	FsMutation,
+	FsMutationObserver,
+	WorkspaceFs,
+} from "../tools/fs.ts";
 import { missingParents, observeMutations, unobserved } from "../tools/fs.ts";
 import { errorText, formatBytes, sha256Hex, ToolFailure } from "../tools/util.ts";
 import type { Workspace } from "../tools/workspace.ts";
@@ -44,7 +50,9 @@ interface RestorePlan {
  * Only mutations that go through a `WorkspaceFs` are covered — `write`, `edit`
  * and every language-server workspace edit, including its create, rename and
  * delete resource operations, locally and over SSH. Shell commands and MCP
- * servers write through their own channels and are explicitly not tracked.
+ * servers write through their own channels; of those, only what a foreground
+ * shell command did to files the agent had seen is filed afterwards, through
+ * `external` (see `SeenFileChanges`). Everything else is not tracked.
  */
 export class FileCheckpoints {
 	constructor(
@@ -62,6 +70,7 @@ export class FileCheckpoints {
 		if (!owner) return operation();
 		const { sessionId } = owner;
 		const observer: FsMutationObserver = {
+			external: (_fs, changes) => this.recordExternal(sessionId, checkpointId, context, changes),
 			observe: async <R>(fs: WorkspaceFs, mutation: FsMutation, apply: () => Promise<R>): Promise<R> => {
 				let started = false;
 				try {
@@ -237,6 +246,46 @@ export class FileCheckpoints {
 				// The resulting state could not be read, so the record stays
 				// `pending` and a later restore refuses it instead of guessing.
 			}
+		}
+	}
+
+	/**
+	 * Files a change made outside `WorkspaceFs` — a shell command rewriting a file the agent had
+	 * seen — as an already-settled mutation, so rewind and session_diff treat it like an edit.
+	 * Both sides' bytes are retained; a restore still refuses if the file moved on since.
+	 */
+	private recordExternal(
+		sessionId: string,
+		checkpointId: string,
+		context: ToolContext,
+		changes: ExternalChange[],
+	): void {
+		const workspace = this.workspaceFor(context);
+		const snapshot = (state: ExternalState): FileSnapshot => {
+			if (state.kind === "missing") return state;
+			const hash = sha256Hex(state.bytes);
+			if (!this.store.hasBlob(hash)) this.store.putBlob(hash, state.bytes);
+			return { kind: "file", hash, size: state.bytes.length, mode: state.mode };
+		};
+		for (const change of changes) {
+			if (
+				[change.before, change.after].some(
+					(state) => state.kind === "file" && state.bytes.length > CAPTURE_LIMIT,
+				)
+			)
+				continue;
+			const id = this.store.recordMutation({
+				sessionId,
+				checkpointId,
+				workspaceId: workspace.id,
+				cwd: context.cwd,
+				...(context.remote ? { remote: context.remote } : {}),
+				path: change.path,
+				operation: change.after.kind === "missing" ? "remove" : "write",
+				before: snapshot(change.before),
+				at: Date.now(),
+			});
+			this.store.settleMutation(id, "done", snapshot(change.after));
 		}
 	}
 

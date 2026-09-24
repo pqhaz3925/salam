@@ -1,6 +1,6 @@
-import solidPlugin from "@opentui/solid/bun-plugin";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import solidPlugin from "@opentui/solid/bun-plugin";
 import { resolveSyntaxAssets } from "../src/ui/syntax.ts";
 
 const root = resolve(import.meta.dir, "..");

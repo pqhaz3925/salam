@@ -50,6 +50,7 @@ export const slashCommands: readonly SlashCommand[] = [
 		detail: "fork before a labelled event and pick a restore mode",
 	},
 	{ name: "/new", hint: "", detail: "start a fresh session" },
+	{ name: "/title", hint: "[TEXT|auto]", detail: "show, set or regenerate this dialog's title" },
 	{ name: "/compact", hint: "", detail: "summarise and shrink context" },
 	{ name: "/recap", hint: "[focus]", detail: "read-only conversation summary" },
 	{

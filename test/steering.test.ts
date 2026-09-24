@@ -1,8 +1,8 @@
+import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { expect, test } from "bun:test";
 import type {
 	HarnessTool,
 	HistoryEntry,
@@ -71,6 +71,7 @@ async function fixture(
 	respond: (request: ProviderRequest, index: number) => Reply | Promise<Reply>,
 	tools: HarnessTool[] = [],
 	maxTurns = 10,
+	overrides: Partial<ProviderGateway> = {},
 ) {
 	const root = await mkdtemp(join(tmpdir(), "salam-steering-"));
 	const config: SalamConfig = {
@@ -140,6 +141,7 @@ async function fixture(
 		}),
 		authStatus: async () => [],
 		close: async () => {},
+		...overrides,
 	};
 	const integrations: IntegrationServices = {
 		tools,
@@ -246,6 +248,157 @@ test("interrupting a stream sends queued and new messages at once, in one reques
 		expect(f.overlapped).toBe(false);
 		expect(f.controller.snapshot().steering).toEqual([]);
 		expect(f.controller.snapshot().busy).toBe(false);
+	} finally {
+		await f.close();
+	}
+});
+
+test("escape with queued messages interrupts the stream and sends them at once", async () => {
+	const streaming = Promise.withResolvers<void>();
+	const f = await fixture((request, index) => {
+		if (index > 0) return [{ type: "text", text: "handled" }];
+		streaming.resolve();
+		return held(request, never, [{ type: "text", text: "never finishes" }]);
+	});
+	try {
+		const first = f.controller.submit("long task");
+		await streaming.promise;
+		await f.controller.submit("queued one");
+		await f.controller.submit("queued two");
+		await Promise.all([first, f.controller.sendQueued()]);
+		expect(f.requests).toEqual([
+			["user long task"],
+			["user long task", "user queued one", "user queued two"],
+		]);
+		expect(f.overlapped).toBe(false);
+		expect(f.controller.snapshot().steering).toEqual([]);
+		expect(f.controller.snapshot().busy).toBe(false);
+	} finally {
+		await f.close();
+	}
+});
+
+test("escape with nothing queued is a plain cancel", async () => {
+	const streaming = Promise.withResolvers<void>();
+	const f = await fixture((request) => {
+		streaming.resolve();
+		return held(request, never, [{ type: "text", text: "never finishes" }]);
+	});
+	try {
+		const first = f.controller.submit("long task");
+		await streaming.promise;
+		await Promise.all([first, f.controller.sendQueued()]);
+		expect(f.requests).toEqual([["user long task"]]);
+		expect(f.controller.snapshot().busy).toBe(false);
+		expect(f.controller.snapshot().status).toBe("Interrupted");
+	} finally {
+		await f.close();
+	}
+});
+
+test("a command_watch match wakes the idle agent with the matching line; a long foreground sleep is refused", async () => {
+	const woke = Promise.withResolvers<string>();
+	const resultText = (request: ProviderRequest, id: string) => {
+		for (const entry of request.entries)
+			if (entry.kind === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id)
+				return entry.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+		throw new Error(`no result for ${id}`);
+	};
+	let job = "";
+	const f = await fixture((request, index) => {
+		if (index === 0)
+			return [
+				{ type: "toolCall", id: "nap", name: "shell", arguments: { command: "sleep 300" } },
+				{
+					type: "toolCall",
+					id: "bg",
+					name: "shell",
+					arguments: { command: "sleep 0.5; echo 'listening on :4000'; sleep 30", background: true },
+				},
+			];
+		if (index === 1) {
+			expect(resultText(request, "nap")).toContain("Refused: this command sleeps 300s");
+			job = /as (\S+?)[,\]]/.exec(resultText(request, "bg"))![1]!;
+			return [
+				{ type: "toolCall", id: "watch", name: "command_watch", arguments: { id: job, log: "listening" } },
+			];
+		}
+		if (index === 2) {
+			expect(resultText(request, "watch")).toContain(`Watching ${job}`);
+			return [{ type: "text", text: "waiting for the server" }];
+		}
+		if (index > 3) return [{ type: "text", text: "the server is up" }];
+		woke.resolve(summarize(request.entries.at(-1)!));
+		return [{ type: "toolCall", id: "stop", name: "command_stop", arguments: { id: job } }];
+	});
+	try {
+		await f.controller.submit("start the server and tell me when it listens");
+		expect(f.requests).toHaveLength(3);
+		const mail = await woke.promise;
+		expect(mail.startsWith("synthetic [command_watch]")).toBe(true);
+		expect(mail).not.toContain("Agent message");
+		expect(mail).toContain("listening on :4000");
+	} finally {
+		await f.close();
+	}
+	// A real agent loop, shell and watch poll: slow under a loaded parallel run.
+}, 15_000);
+
+test("the footer quota is fetched in the background and not refetched by an immediate turn", async () => {
+	let calls = 0;
+	const fetched = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+	const f = await fixture(() => [{ type: "text", text: "done" }], [], 10, {
+		async usage(choice) {
+			const used = calls === 0 ? 0.25 : 0.5;
+			const index = calls++;
+			queueMicrotask(() => fetched[index]?.resolve());
+			return {
+				provider: choice.provider,
+				fetchedAt: Date.now(),
+				report: {
+					provider: "anthropic",
+					fetchedAt: Date.now(),
+					limits: [
+						{
+							id: "x:5h",
+							label: "5 Hour",
+							scope: { provider: "anthropic", windowId: "5h", shared: true },
+							window: { id: "5h", label: "5 Hour", durationMs: 5 * 3_600_000 },
+							amount: { usedFraction: used, unit: "percent" },
+						},
+					],
+				},
+			};
+		},
+	});
+	try {
+		await fetched[0]!.promise;
+		await Bun.sleep(0);
+		expect(f.controller.snapshot().quota?.windows).toEqual([{ label: "5h", remaining: 0.75 }]);
+		// A turn right after startup is inside the refresh gap: no second fetch yet.
+		await f.controller.submit("hi");
+		expect(calls).toBe(1);
+	} finally {
+		await f.close();
+	}
+});
+
+test("pasted images travel with the queued message into the user turn", async () => {
+	let seen: unknown;
+	const f = await fixture((request) => {
+		const last = request.entries.at(-1)!;
+		if (last.kind === "message") seen = last.message.content;
+		return [{ type: "text", text: "a red dot" }];
+	});
+	try {
+		const image = { data: "iVBORw0KGgo=", mimeType: "image/png" };
+		await f.controller.submit("what is this [Image #1]", "steer", [image]);
+		expect(seen).toEqual([
+			{ type: "text", text: "what is this [Image #1]" },
+			{ type: "image", data: image.data, mimeType: image.mimeType },
+		]);
+		const item = f.controller.snapshot().items.find((entry) => entry.kind === "user");
+		expect(item?.text).toBe("what is this [Image #1]");
 	} finally {
 		await f.close();
 	}

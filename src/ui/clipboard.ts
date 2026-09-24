@@ -1,5 +1,5 @@
+import type { ClipboardService, ClipboardWriteResult, CliRenderer } from "@opentui/core";
 import { createClipboard, createHostClipboard, createRendererClipboardAdapter } from "@opentui/core";
-import type { CliRenderer, ClipboardService, ClipboardWriteResult } from "@opentui/core";
 import { truncate } from "./text.ts";
 
 /**
@@ -14,8 +14,15 @@ import { truncate } from "./text.ts";
 export interface SelectionCopier {
 	/** Resolves to a short, truthful status line for the activity row. */
 	copy(text: string): Promise<string>;
+	/**
+	 * The system clipboard's image, or its text when it holds no image; undefined
+	 * when there is neither or no host clipboard is reachable (e.g. over SSH).
+	 */
+	read(): Promise<{ image: Uint8Array } | { text: string } | undefined>;
 	dispose(): Promise<void>;
 }
+
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/tiff"] as const;
 
 function amount(text: string): string {
 	const lines = text.split("\n").length;
@@ -67,6 +74,19 @@ export function createSelectionCopier(renderer: CliRenderer): SelectionCopier {
 			} catch (error) {
 				return `copy failed: ${error instanceof Error ? error.message : String(error)}`;
 			}
+		},
+		async read() {
+			if (!service) return undefined;
+			for (const type of IMAGE_TYPES) {
+				const result = await service.read({ preferredTypes: [type] });
+				if (result.status === "read" && result.representation.bytes.length > 0)
+					return { image: result.representation.bytes };
+				if (result.status === "unsupported" || result.status === "failed") break;
+			}
+			const text = await service.read({ preferredTypes: ["text/plain"] });
+			return text.status === "read"
+				? { text: new TextDecoder().decode(text.representation.bytes) }
+				: undefined;
 		},
 		async dispose() {
 			await service?.dispose();

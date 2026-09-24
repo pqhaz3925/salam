@@ -1,3 +1,18 @@
+import type {
+	AssistantMessageEventStream,
+	Context,
+	ImageContent,
+	Message,
+	Model,
+	TextContent,
+	Tool,
+	Usage,
+} from "@oh-my-pi/pi-ai";
+import type {
+	AnthropicMessageParam,
+	AnthropicOptions,
+	AnthropicUsageLike,
+} from "@oh-my-pi/pi-ai/providers/anthropic";
 import {
 	applyAnthropicUsageExtras,
 	applyClaudeToolPrefix,
@@ -10,23 +25,8 @@ import {
 	streamAnthropic,
 } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { AnthropicMessagesClient } from "@oh-my-pi/pi-ai/providers/anthropic-client";
-import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import type {
-	AnthropicMessageParam,
-	AnthropicOptions,
-	AnthropicUsageLike,
-} from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import type {
-	AssistantMessageEventStream,
-	Context,
-	ImageContent,
-	Message,
-	Model,
-	TextContent,
-	Tool,
-	Usage,
-} from "@oh-my-pi/pi-ai";
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { HistoryEntry, Json, ProviderRequest } from "../contracts";
 import type { Credential } from "./auth";
 

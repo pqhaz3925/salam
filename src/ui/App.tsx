@@ -1,13 +1,13 @@
-import { MacOSScrollAccel, StyledText, decodePasteBytes, stripAnsiSequences } from "@opentui/core";
 import type {
 	KeyEvent,
 	MouseEvent,
 	PasteEvent,
 	ScrollBoxRenderable,
-	SelectOption,
 	Selection,
+	SelectOption,
 	TextareaRenderable,
 } from "@opentui/core";
+import { decodePasteBytes, MacOSScrollAccel, StyledText, stripAnsiSequences } from "@opentui/core";
 import {
 	useKeyboard,
 	usePaste,
@@ -15,12 +15,12 @@ import {
 	useSelectionHandler,
 	useTerminalDimensions,
 } from "@opentui/solid";
-import { Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 import type { Accessor } from "solid-js";
-import { REASONING_LEVELS } from "../contracts.ts";
+import { createEffect, createMemo, createSignal, on, onCleanup, Show } from "solid-js";
 import type {
 	AppController,
 	AppSnapshot,
+	ImageAttachment,
 	ModelChoice,
 	PendingQuestion,
 	RewindPoint,
@@ -28,23 +28,32 @@ import type {
 	SubmissionMode,
 	UserQuestion,
 } from "../contracts.ts";
+import { REASONING_LEVELS } from "../contracts.ts";
+import { modelTag } from "./blocks.tsx";
 import { suggestCommands } from "./commands.ts";
-import { OverlayHeading, Picker, buildAgentsText, buildSuggestionText } from "./overlays.tsx";
+import { attachmentFromPath, imagePathFrom, imageToken, referencedImages, toAttachment } from "./images.ts";
+import { buildAgentsText, buildSuggestionText, OverlayHeading, Picker } from "./overlays.tsx";
+import type { QuestionCursor } from "./question.ts";
+import { buildQuestionText, questionKeys, resolveAnswer } from "./question.ts";
 import { buildActivityText, buildFooterText } from "./status.ts";
 import { StyledLine } from "./styled.tsx";
-import { accent, faint, glyph, muted, palette, plain, rule, spinnerFrames, user, warn } from "./theme.ts";
 import { formatElapsed, formatWhen, truncate } from "./text.ts";
-import { ConversationRows } from "./transcript.tsx";
-import { modelTag } from "./blocks.tsx";
-import { buildQuestionText, questionKeys, resolveAnswer } from "./question.ts";
-import type { QuestionCursor } from "./question.ts";
+import { faint, glyph, muted, palette, plain, rule, spinnerFrames, text, user, warn } from "./theme.ts";
 import { buildTodoLine, buildTodoRows, todoProgress } from "./todo.ts";
 import type { Transcript } from "./transcript.tsx";
+import { ConversationRows } from "./transcript.tsx";
 
 type Overlay = "model" | "effort" | "resume" | "rewind" | "rewind-mode" | "agents" | "todo" | null;
 
 /** Idle key hints, most important first; the activity row drops trailing ones on narrow terminals. */
-const IDLE_KEYS = ["enter send", "/ commands", "ctrl+o tool output", "shift+enter newline", "drag to copy"];
+const IDLE_KEYS = [
+	"enter send",
+	"/ commands",
+	"ctrl+o tool output",
+	"shift+enter newline",
+	"ctrl+v image",
+	"drag to copy",
+];
 const EXIT_ARM_MS = 2500;
 const HINT_MS = 3000;
 
@@ -68,6 +77,8 @@ export function App(props: {
 	exit: () => void;
 	/** Puts text on the system clipboard; resolves to the status line to flash. */
 	copy: (text: string) => Promise<string>;
+	/** The system clipboard's image, else its text; undefined when empty or unreachable. */
+	readClipboard?: () => Promise<{ image: Uint8Array } | { text: string } | undefined>;
 }) {
 	const dimensions = useTerminalDimensions();
 	const renderer = useRenderer();
@@ -85,6 +96,9 @@ export function App(props: {
 	let draft = "";
 	let shownSession: string | undefined;
 	const history: string[] = [];
+	/** Images attached to the current draft, keyed by their `[Image #n]` token number. */
+	const attachments = new Map<number, ImageAttachment>();
+	let attachmentCounter = 0;
 	/** The composer draft set aside while the composer answers a question. */
 	let stashedDraft: string | undefined;
 	/** Answers collected for the pending question's earlier sub-questions. */
@@ -102,6 +116,10 @@ export function App(props: {
 	const [hint, setHint] = createSignal("");
 	const [secret, setSecret] = createSignal("");
 	const [tick, setTick] = createSignal(0);
+	/** Wall clock for the footer's quota reset countdowns, advanced twice a minute. */
+	const [clock, setClock] = createSignal(Date.now());
+	const clockTimer = setInterval(() => setClock(Date.now()), 30_000);
+	clockTimer.unref?.();
 	/** Wall time of the last run that finished in the shown session; cleared when a run starts. */
 	const [completedMs, setCompletedMs] = createSignal<number>();
 	const [todoOffset, setTodoOffset] = createSignal(0);
@@ -143,6 +161,7 @@ export function App(props: {
 			width: width(),
 			home: props.home,
 			expanded: props.transcript.expanded(),
+			now: clock(),
 		}),
 	);
 	/** A main-session shell command is still running in the foreground of the latest turn. */
@@ -181,9 +200,9 @@ export function App(props: {
 			// The primer is only needed before the first completed run.
 			return completedMs() === undefined ? IDLE_KEYS : [];
 		}
-		const keys = drafting ? ["enter queue", "ctrl+enter interrupt + send"] : [];
-		if (shellRunning()) keys.push("ctrl+b background shell");
-		keys.push("esc interrupt");
+		const keys = drafting ? ["enter to queue", "ctrl+enter to interrupt + send"] : [];
+		if (shellRunning()) keys.push("ctrl+b to background");
+		keys.push(props.snapshot().steering.length > 0 ? "esc to interrupt + send queued" : "esc to interrupt");
 		return keys;
 	};
 
@@ -515,11 +534,65 @@ export function App(props: {
 			await runCommand(text.trim());
 			return;
 		}
+		const images = referencedImages(text, attachments);
+		attachments.clear();
+		attachmentCounter = 0;
 		try {
-			await props.controller.submit(text, mode);
+			await props.controller.submit(text, mode, images.length ? images : undefined);
 		} catch (error) {
 			props.transcript.notice(describe(error), true);
 		}
+	}
+
+	/** Adds an image to the draft as an `[Image #n]` token at the cursor. */
+	async function attachImage(load: () => Promise<ImageAttachment | undefined>): Promise<boolean> {
+		try {
+			const image = await load();
+			if (!image) return false;
+			attachmentCounter += 1;
+			attachments.set(attachmentCounter, image);
+			const token = imageToken(attachmentCounter);
+			if (input) input.insertText(`${token} `);
+			else writeComposer(`${readComposer()}${token} `);
+			setBuffer(readComposer());
+			flashHint(`attached ${token} (${Math.round((image.data.length * 3) / 4 / 1024)} KB)`);
+			return true;
+		} catch (error) {
+			flashHint(`image not attached: ${describe(error)}`);
+			return true;
+		}
+	}
+
+	/**
+	 * Ctrl+V (or Cmd+V when the terminal forwards it, or a paste that arrived
+	 * empty because the clipboard holds only an image): attaches the clipboard
+	 * image, or pastes its text — attaching the file when that text is the path
+	 * of an image, as a Finder copy or a drag-and-drop gives.
+	 */
+	async function pasteClipboard(): Promise<void> {
+		if (!props.readClipboard) {
+			flashHint("clipboard unavailable");
+			return;
+		}
+		const clip = await props.readClipboard().catch(() => undefined);
+		if (!clip) {
+			flashHint("clipboard is empty or unreachable");
+			return;
+		}
+		if ("image" in clip) {
+			await attachImage(() => toAttachment(clip.image));
+			return;
+		}
+		if (await pastePath(clip.text)) return;
+		if (input) input.insertText(clip.text);
+		else writeComposer(`${readComposer()}${clip.text}`);
+		setBuffer(readComposer());
+	}
+
+	/** Attaches the image a pasted path names; false when the text is not an image path. */
+	async function pastePath(text: string): Promise<boolean> {
+		const path = imagePathFrom(text);
+		return path ? attachImage(() => attachmentFromPath(path)) : false;
 	}
 
 	function acceptSuggestion(run: boolean): void {
@@ -637,6 +710,12 @@ export function App(props: {
 
 		if (secretMode()) {
 			handleSecretKey(key);
+			return;
+		}
+
+		if ((key.ctrl || key.super) && key.name === "v" && !key.shift && overlay() === null) {
+			key.preventDefault();
+			void pasteClipboard();
 			return;
 		}
 
@@ -775,6 +854,13 @@ export function App(props: {
 		if (key.name === "escape") {
 			key.preventDefault();
 			if (snapshot.busy) {
+				if (snapshot.steering.length > 0) {
+					props.controller
+						.sendQueued()
+						.catch((error: unknown) => props.transcript.notice(describe(error), true));
+					flashHint("interrupted, sending queued");
+					return;
+				}
 				props.controller.cancel();
 				flashHint("interrupted");
 				return;
@@ -805,7 +891,27 @@ export function App(props: {
 	});
 
 	usePaste((event: PasteEvent) => {
-		if (!secretMode()) return;
+		if (!secretMode()) {
+			if (overlay() !== null) return;
+			const pasted = decodePasteBytes(event.bytes);
+			// Cmd+V with only an image on the clipboard arrives as an empty paste.
+			if (pasted.trim().length === 0) {
+				event.preventDefault();
+				void pasteClipboard();
+				return;
+			}
+			const path = imagePathFrom(stripAnsiSequences(pasted));
+			if (!path) return;
+			event.preventDefault();
+			void attachImage(() => attachmentFromPath(path)).then((attached) => {
+				// Not a readable image after all: paste the text as typed.
+				if (!attached && input) {
+					input.insertText(pasted);
+					setBuffer(readComposer());
+				}
+			});
+			return;
+		}
 		event.preventDefault();
 		const text = stripAnsiSequences(decodePasteBytes(event.bytes)).replace(/[\r\n]+/g, "");
 		setSecret((value) => value + text);
@@ -876,7 +982,7 @@ export function App(props: {
 	createEffect(() => {
 		const busy = props.snapshot().busy;
 		if (busy && spinTimer === undefined) {
-			spinTimer = setInterval(() => setTick((value) => value + 1), 90);
+			spinTimer = setInterval(() => setTick((value) => value + 1), 120);
 		} else if (!busy && spinTimer !== undefined) {
 			clearInterval(spinTimer);
 			spinTimer = undefined;
@@ -892,6 +998,7 @@ export function App(props: {
 	onCleanup(() => {
 		unsubscribeDraft();
 		clearInterval(spinTimer);
+		clearInterval(clockTimer);
 		clearTimeout(exitTimer);
 		clearTimeout(hintTimer);
 	});
@@ -1048,7 +1155,7 @@ export function App(props: {
 					when={!secretMode()}
 					fallback={
 						<box flexDirection="row" width="100%">
-							<StyledLine wrapMode="none" width={2} content={new StyledText([accent(`${glyph.caret} `)])} />
+							<StyledLine wrapMode="none" width={2} content={new StyledText([text(`${glyph.prompt} `)])} />
 							<StyledLine
 								wrapMode="none"
 								content={
@@ -1061,7 +1168,7 @@ export function App(props: {
 					}
 				>
 					<box flexDirection="row" width="100%">
-						<StyledLine wrapMode="none" width={2} content={new StyledText([accent(`${glyph.caret} `)])} />
+						<StyledLine wrapMode="none" width={2} content={new StyledText([text(`${glyph.prompt} `)])} />
 						<textarea
 							ref={(element: TextareaRenderable) => {
 								input = element;

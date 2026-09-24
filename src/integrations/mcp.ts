@@ -42,7 +42,7 @@ const LOCAL_PLAYWRIGHT_COMMANDS: Record<string, true> = {
 const PACKAGE_RUNNERS: Record<string, true> = { npx: true, bunx: true, npm: true, pnpm: true, yarn: true };
 
 export type McpTransportKind = "stdio" | "http";
-export type McpServerState = "connected" | "failed" | "disconnected" | "closed";
+export type McpServerState = "connecting" | "connected" | "failed" | "disconnected" | "closed";
 export type McpFailureKind =
 	| "unknown-server"
 	| "unknown-tool"
@@ -190,6 +190,8 @@ function describeError(error: unknown): string {
 export class McpHub {
 	private readonly connections = new Map<string, Connection>();
 	private shutdownPromise: Promise<void> | null = null;
+	private startup: Promise<void> = Promise.resolve();
+	private readonly shutdownAbort = new AbortController();
 
 	private constructor(private readonly config: SalamConfig) {}
 
@@ -220,23 +222,32 @@ export class McpHub {
 				lastFailureAt: 0,
 			});
 		}
-		await Promise.all(
+		// Servers connect in the background so a slow launcher (npx, uvx, a cold network endpoint)
+		// never delays startup. A request to a server still connecting joins its pending attempt;
+		// callers that need the complete startup picture (catalogue, server instructions) await settled().
+		hub.startup = Promise.all(
 			names.map(async (name) => {
 				const connection = hub.connections.get(name);
 				if (!connection) return;
 				// Failures are recorded on the connection; startup never rejects because of a bad server.
 				await hub.connect(connection, true).catch(() => {});
 			}),
-		);
-		hub.rebuildCatalogue();
+		).then(() => {
+			hub.rebuildCatalogue();
+		});
 		return hub;
+	}
+
+	/** Resolves once every configured server's startup connection attempt has finished, either way. */
+	settled(): Promise<void> {
+		return this.startup;
 	}
 
 	servers(): McpServerStatus[] {
 		return [...this.connections.values()].map((connection) => ({
 			name: connection.name,
 			kind: connection.kind,
-			state: connection.state,
+			state: connection.connecting && connection.state !== "connected" ? "connecting" : connection.state,
 			endpoint: connection.endpoint,
 			error: connection.error,
 			server: connection.serverLabel,
@@ -307,8 +318,8 @@ export class McpHub {
 		// Its workspace is the spawn cwd, never the active agent's (possibly SSH) cwd.
 		let linkScope: PlaywrightLinkScope | undefined;
 		if (connection.playwright && tool.startsWith("browser_")) {
-			const meta = args["_meta"];
-			const requestedCwd = meta && typeof meta === "object" ? (meta as Arguments)["cwd"] : undefined;
+			const meta = args._meta;
+			const requestedCwd = meta && typeof meta === "object" ? (meta as Arguments).cwd : undefined;
 			if (
 				requestedCwd === undefined ||
 				(typeof requestedCwd === "string" &&
@@ -338,26 +349,26 @@ export class McpHub {
 				},
 			}),
 		);
-		const content = Array.isArray(result["content"]) ? (result["content"] as McpBlock[]) : [];
-		const structured = result["structuredContent"];
-		if (!Array.isArray(result["content"]) && !("toolResult" in result) && structured === undefined) {
+		const content = Array.isArray(result.content) ? (result.content as McpBlock[]) : [];
+		const structured = result.structuredContent;
+		if (!Array.isArray(result.content) && !("toolResult" in result) && structured === undefined) {
 			throw new McpFailure(
 				"protocol",
 				server,
 				`MCP server '${server}' returned a malformed result for tool '${tool}'.`,
 			);
 		}
-		if ("toolResult" in result && !Array.isArray(result["content"])) {
+		if ("toolResult" in result && !Array.isArray(result.content)) {
 			// 2024-style servers answer with a bare `toolResult` payload.
 			return {
-				content: [{ type: "text", text: JSON.stringify(result["toolResult"], null, 2) }],
-				isError: result["isError"] === true,
-				structured: (result["toolResult"] ?? null) as Json,
+				content: [{ type: "text", text: JSON.stringify(result.toolResult, null, 2) }],
+				isError: result.isError === true,
+				structured: (result.toolResult ?? null) as Json,
 			};
 		}
 		return {
 			content: linkScope ? absolutizePlaywrightLinks(content, linkScope).blocks : content,
-			isError: result["isError"] === true,
+			isError: result.isError === true,
 			structured: structured === undefined ? undefined : (structured as Json),
 		};
 	}
@@ -503,8 +514,14 @@ export class McpHub {
 	async close(): Promise<void> {
 		if (!this.shutdownPromise) {
 			this.shutdownPromise = (async () => {
+				// Startup connects in the background: abort attempts still in flight (closing their
+				// transports, which stops launched processes) before tearing down live clients.
+				this.shutdownAbort.abort();
 				await Promise.all(
-					[...this.connections.values()].map((connection) => this.disconnect(connection, "closed")),
+					[...this.connections.values()].map(async (connection) => {
+						await connection.connecting?.catch(() => {});
+						await this.disconnect(connection, "closed");
+					}),
 				);
 			})();
 		}
@@ -654,7 +671,8 @@ export class McpHub {
 		};
 
 		try {
-			await client.connect(transport, { timeout: CONNECT_TIMEOUT });
+			await client.connect(transport, { timeout: CONNECT_TIMEOUT, signal: this.shutdownAbort.signal });
+			if (this.shutdownPromise) throw new Error("Integrations are shutting down.");
 		} catch (error) {
 			await client.close().catch(() => {});
 			await transport.close().catch(() => {});
@@ -696,7 +714,7 @@ export class McpHub {
 			LOCAL_PLAYWRIGHT_COMMANDS[command] === true &&
 			(!packageRunner || playwrightPackage)
 		) {
-			let outputDir = connection.launchEnv?.["PLAYWRIGHT_MCP_OUTPUT_DIR"];
+			let outputDir = connection.launchEnv?.PLAYWRIGHT_MCP_OUTPUT_DIR;
 			for (let index = 0; index < argv.length; index += 1) {
 				const arg = argv[index]!;
 				if (arg === "--output-dir") outputDir = argv[index + 1];
@@ -707,7 +725,7 @@ export class McpHub {
 				? [resolve(base, outputDir)]
 				: [
 						resolve(base, ".playwright-mcp"),
-						resolve(connection.launchEnv?.["TMPDIR"] ?? tmpdir(), ".playwright-mcp"),
+						resolve(connection.launchEnv?.TMPDIR ?? tmpdir(), ".playwright-mcp"),
 					];
 			connection.playwright = { base, artifactRoots };
 		}
@@ -721,7 +739,10 @@ export class McpHub {
 			try {
 				const discovered: RemoteTool[] = [];
 				for (let page = 0, cursor: string | undefined; page < MAX_PAGES; page += 1) {
-					const result = await client.listTools(cursor ? { cursor } : {}, { timeout: LIST_TIMEOUT });
+					const result = await client.listTools(cursor ? { cursor } : {}, {
+						timeout: LIST_TIMEOUT,
+						signal: this.shutdownAbort.signal,
+					});
 					discovered.push(...(result.tools as RemoteTool[]));
 					cursor = result.nextCursor;
 					if (!cursor) break;
@@ -815,8 +836,8 @@ export class McpHub {
 				tool.inputSchema && typeof tool.inputSchema === "object"
 					? ({ ...tool.inputSchema } as Record<string, unknown>)
 					: {};
-			if (schema["type"] !== "object") schema["type"] = "object";
-			if (!schema["properties"] || typeof schema["properties"] !== "object") schema["properties"] = {};
+			if (schema.type !== "object") schema.type = "object";
+			if (!schema.properties || typeof schema.properties !== "object") schema.properties = {};
 			out.push({
 				server,
 				name: tool.name,

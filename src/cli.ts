@@ -1,15 +1,24 @@
 #!/usr/bin/env bun
-import { parseArgs } from "node:util";
-import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
+import { parseArgs } from "node:util";
 import { loadConfig } from "./config.ts";
 import type { AppController, AppSnapshot } from "./contracts.ts";
-import { createProviderGateway } from "./providers/index.ts";
-import { createTools } from "./tools/index.ts";
 import { createIntegrations } from "./integrations/index.ts";
+import { createProviderGateway } from "./providers/index.ts";
 import { createRuntime, listSessions } from "./runtime/index.ts";
+import { createTools } from "./tools/index.ts";
+import {
+	heldEntries,
+	listRecovery,
+	parseAge,
+	pruneRecovery,
+	RECOVERY_LIMIT,
+	type RecoveryEntry,
+	recoveryRoots,
+} from "./tools/recovery-store.ts";
 import { startUI } from "./ui/index.tsx";
 import { resumeCommand } from "./ui/resume.ts";
 
@@ -25,17 +34,28 @@ Usage:
   salam auth                       Show credential availability (never tokens)
   salam login PROVIDER             Authorize a subscription
   salam sessions                   List saved conversations
+  salam recovery                   List retained file-recovery entries (never pruned automatically)
+  salam recovery prune ENTRY...    Remove the named entries (paths or entry-N as listed)
+  salam recovery prune --older-than 14d
+                                   Remove entries older than an age (m/h/d/w); entries any
+                                   process still holds open are skipped unless --force
 
 Options:
   --cwd PATH                      Working directory
   --home PATH                     Private salam state directory (default ~/.salam)
   --config PATH                   Additional configuration JSON
   --remote NAME                   Work on a configured SSH target
+  --tools NAME,NAME               Offer only these tools, with a system prompt that names no others
+  --lean                          Shell-first set: shell (with background jobs via command_output/
+                                  command_stop), web_search, web_fetch, ask, view_image, todo and
+                                  goal_complete/goal_pause for /goal, agents_*, history_read/
+                                  history_search; auto memory as
+                                  plain files through the shell, as in Claude Code; no MCP
   --help, -h                      Show this help
   --version, -v                   Show the version
 
 In the terminal:
-  /help  /model  /effort  /sessions  /resume  /new  /agents  /context  /todo
+  /help  /model  /effort  /title  /sessions  /resume  /new  /agents  /context  /todo
   /rewind  /recap  /usage  /compact  /tools  /remote  /auth  /login  /quit
   /goal  /loop  /jobs  /wait  /output  /kill  /memory
   Enter submits (queues while a turn is running); Shift+Enter or Alt+Enter inserts a newline.
@@ -62,13 +82,20 @@ Session controls:
   /model                          Choose a model; /model PROVIDER/MODEL switches directly.
   Switching keeps this dialog: each model keeps its own native history and cache prefix,
   and only the events it has not seen yet are appended when you return to it.
+  The choice is remembered for new sessions: per directory, else the last one anywhere
+  (<home>/model-state.json). --model and SALAM_MODEL override it; it overrides config "model".
+  /title [TEXT|auto]               Show or rename this dialog. By default the model titles a session
+  from its first message (config "autoTitle": false keeps the message itself); /title TEXT is
+  never overwritten, /title auto regenerates. The terminal window shows the title.
   /resume                         Choose a saved session; /resume ID|latest selects directly.
   /rewind                         Choose a labelled user, model, tool or agent event, then a restore mode.
   /rewind ID conversation          Fork history before that event; the source branch is kept intact.
   /rewind ID files                 Restore tracked file/directory changes only, without git.
   /rewind ID both                  Restore tracked files and fork history before that event.
   Each model's prefix cache key carries over the fork, but provider cache retention is never guaranteed.
-  File rewind refuses external changes. Shell/MCP side effects are not tracked.
+  File rewind refuses external changes. A foreground shell command's changes to files the agent
+  had already seen are tracked (with --lean/--tools, also files named in the command, such as
+  cat > new.py); other shell and MCP side effects are not.
   /recap [focus]                   Summarize without changing the working context.
   /usage [session|provider|all]     Recorded tokens/cache/cost estimates and actual quota windows.
   /memory [on|off|list]            Inspect project memory, persist an auto-memory toggle, or list its files.
@@ -142,6 +169,80 @@ Example configuration:
 }
 `;
 
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function recoveryCommand(
+	args: string[],
+	olderThan: string | undefined,
+	force: boolean,
+	cwd: string | undefined,
+): Promise<void> {
+	const roots = await recoveryRoots(resolve(cwd ?? process.cwd()));
+	const entries = await listRecovery(roots);
+	const [sub, ...names] = args;
+	if (sub === undefined) {
+		if (olderThan !== undefined || force)
+			throw new Error("--older-than and --force need salam recovery prune.");
+		if (!entries.length) {
+			process.stdout.write(`No recovery entries${roots.length ? ` in ${roots.join(", ")}` : ""}.\n`);
+			return;
+		}
+		const held = await heldEntries(roots);
+		for (const root of roots) {
+			const mine = entries.filter((entry) => entry.root === root);
+			const total = mine.reduce((sum, entry) => sum + entry.bytes, 0);
+			process.stdout.write(`${root} — ${mine.length} of ${RECOVERY_LIMIT} entries, ${formatBytes(total)}\n`);
+			for (const entry of mine)
+				process.stdout.write(
+					`  ${entry.directory.slice(root.length + 1).padEnd(11)} ${new Date(entry.createdAt ?? 0).toISOString().slice(0, 16).replace("T", " ")}  ${(entry.operation ?? "?").padEnd(6)} ${formatBytes(entry.bytes).padStart(9)}  ${entry.path ?? "(no manifest)"}${held?.has(entry.directory) ? "  [open]" : ""}\n`,
+				);
+		}
+		if (!held) process.stdout.write("(lsof unavailable: open-file status unknown)\n");
+		process.stdout.write(
+			"Remove with: salam recovery prune ENTRY... or salam recovery prune --older-than 14d\n",
+		);
+		return;
+	}
+	if (sub !== "prune") throw new Error(`Unknown recovery command ${sub}. Run salam --help.`);
+	if (!names.length && olderThan === undefined)
+		throw new Error("Name entries to remove, or pass --older-than AGE (e.g. 14d). Nothing was removed.");
+	if (names.length && olderThan !== undefined) throw new Error("Choose either entry names or --older-than.");
+	let selected: RecoveryEntry[];
+	if (olderThan !== undefined) {
+		const cutoff = Date.now() - parseAge(olderThan);
+		selected = entries.filter((entry) => (entry.createdAt ?? 0) < cutoff);
+	} else {
+		selected = [];
+		for (const name of names) {
+			const matches = entries.filter(
+				(entry) => entry.directory === resolve(name) || entry.directory.endsWith(`/${name}`),
+			);
+			if (matches.length !== 1)
+				throw new Error(
+					`${name} ${matches.length ? `is ambiguous (${matches.map((entry) => entry.directory).join(", ")}); give the full path` : "is not a recovery entry"}. Nothing was removed.`,
+				);
+			selected.push(matches[0]!);
+		}
+	}
+	if (!selected.length) {
+		process.stdout.write("No entries matched; nothing was removed.\n");
+		return;
+	}
+	const result = await pruneRecovery(selected, await heldEntries(roots), force);
+	const freed = result.removed.reduce((sum, entry) => sum + entry.bytes, 0);
+	process.stdout.write(`Removed ${result.removed.length} entries (${formatBytes(freed)}).\n`);
+	for (const entry of result.held)
+		process.stdout.write(
+			`Kept ${entry.directory}: a process still has it open (--force removes it anyway).\n`,
+		);
+	for (const { entry, error } of result.failed) process.stdout.write(`Failed ${entry.directory}: ${error}\n`);
+	if (result.failed.length) process.exitCode = 1;
+}
+
 async function main(): Promise<void> {
 	const { values, positionals } = parseArgs({
 		args: process.argv.slice(2),
@@ -157,6 +258,10 @@ async function main(): Promise<void> {
 			model: { type: "string" },
 			resume: { type: "string" },
 			remote: { type: "string" },
+			tools: { type: "string" },
+			lean: { type: "boolean" },
+			"older-than": { type: "string" },
+			force: { type: "boolean" },
 		},
 	});
 	if (values.help) {
@@ -167,8 +272,40 @@ async function main(): Promise<void> {
 		process.stdout.write("salam 0.1.0\n");
 		return;
 	}
+	if (values.lean && values.tools !== undefined) throw new Error("Choose either --lean or --tools");
+	const tools = values.lean
+		? [
+				"shell",
+				"command_output",
+				"command_stop",
+				"web_search",
+				"web_fetch",
+				"ask",
+				"view_image",
+				"todo",
+				"goal_complete",
+				"goal_pause",
+				"agents_spawn",
+				"agents_status",
+				"agents_wait",
+				"agents_send",
+				"agents_cancel",
+				"history_read",
+				"history_search",
+			]
+		: values.tools
+				?.split(",")
+				.map((name) => name.trim())
+				.filter(Boolean);
+	if (tools?.length === 0) throw new Error("--tools needs at least one tool name");
 	if (values.json && values.print === undefined) throw new Error('--json requires -p "task"');
 	const action = positionals[0];
+	if (action === "recovery") {
+		await recoveryCommand(positionals.slice(1), values["older-than"], values.force === true, values.cwd);
+		return;
+	}
+	if (values["older-than"] !== undefined || values.force)
+		throw new Error("--older-than and --force apply only to salam recovery prune.");
 	if (action && !["models", "auth", "login", "sessions"].includes(action))
 		throw new Error(`Unknown command ${action}. Run salam --help.`);
 	if (action && values.print !== undefined) throw new Error("Choose either a command or --print");
@@ -182,6 +319,11 @@ async function main(): Promise<void> {
 		file: values.config,
 		model: values.model,
 	});
+	if (tools) {
+		config.tools = [...new Set(tools)];
+		// MCP servers contribute their own instructions; start none unless MCP tools are offered.
+		if (!tools.some((name) => name.startsWith("mcp_"))) config.mcpServers = {};
+	}
 	if (action === "sessions") {
 		for (const session of listSessions(config))
 			process.stdout.write(

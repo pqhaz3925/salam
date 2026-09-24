@@ -2,5 +2,12 @@
   "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
   "files": { "includes": ["src/**", "scripts/**", "test/**"] },
   "formatter": { "enabled": true, "indentStyle": "tab", "lineWidth": 110 },
-  "javascript": { "formatter": { "quoteStyle": "double" } }
+  "javascript": { "formatter": { "quoteStyle": "double" } },
+  "linter": {
+    "rules": {
+      "style": {
+        "noNonNullAssertion": "off"
+      }
+    }
+  }
 }

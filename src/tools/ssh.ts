@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RemoteTarget } from "../contracts.ts";
-import { Executor, type ExecOptions, type PreparedCommand } from "./exec.ts";
+import { type ExecOptions, Executor, type PreparedCommand } from "./exec.ts";
 import { REMOTE_HELPER_FILENAME, REMOTE_HELPER_SOURCE } from "./remote-helper.ts";
 import { sha256Hex, shellQuote, ToolFailure } from "./util.ts";
 
@@ -73,6 +73,7 @@ export function connectionKey(target: RemoteTarget): string {
 }
 
 /** Remote cache root; expanded by the remote shell, never by us. */
+// biome-ignore lint/suspicious/noTemplateCurlyInString: a shell parameter expansion, deliberately left for the remote shell.
 const REMOTE_CACHE_EXPR = '"${XDG_CACHE_HOME:-$HOME/.cache}/salam"';
 
 /**

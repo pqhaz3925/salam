@@ -1,4 +1,5 @@
-import { open, readdir, realpath, stat } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { type FileHandle, open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 
@@ -56,7 +57,7 @@ export async function readTextCached(path: string, maxBytes: number): Promise<Ca
 	const hit = textCache.get(key);
 	if (hit && sameStamp(hit.stamp, stamp)) return hit;
 
-	let handle;
+	let handle: FileHandle;
 	try {
 		handle = await open(path, "r");
 	} catch {
@@ -96,7 +97,7 @@ export interface DirEntry {
 }
 
 export async function listDirectory(path: string): Promise<DirEntry[]> {
-	let entries;
+	let entries: Dirent[];
 	try {
 		entries = await readdir(path, { withFileTypes: true });
 	} catch {
@@ -158,7 +159,7 @@ export function displayPath(path: string, cwd: string): string {
 		const rel = path.slice(cwd.length).replace(/^[/\\]/, "");
 		if (rel.length > 0) return rel;
 	}
-	if (withinRoot(path, home)) return "~" + path.slice(home.length);
+	if (withinRoot(path, home)) return `~${path.slice(home.length)}`;
 	return path;
 }
 
@@ -209,7 +210,7 @@ export function firstParagraph(body: string, limit = 240): string {
 			.filter((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith("---"))
 			.join(" ")
 			.trim();
-		if (cleaned.length > 0) return cleaned.length > limit ? cleaned.slice(0, limit - 1) + "…" : cleaned;
+		if (cleaned.length > 0) return cleaned.length > limit ? `${cleaned.slice(0, limit - 1)}…` : cleaned;
 	}
 	return "";
 }

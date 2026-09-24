@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Executor, ExecOptions, ExecResult, RunningCommand } from "./exec.ts";
+import type { ExecOptions, ExecResult, Executor, RunningCommand } from "./exec.ts";
 import { PROCESS_SUPERVISOR_FILENAME, PROCESS_SUPERVISOR_SOURCE } from "./process-supervisor.ts";
 import { ToolFailure } from "./util.ts";
 
@@ -108,6 +108,10 @@ export async function supervisorRequest<T = SupervisorSnapshot>(
 	return response;
 }
 
+/** Bounded patience for a supervisor that is alive but refusing connections. */
+const STATUS_RETRIES = 20;
+const STATUS_RETRY_MS = 100;
+
 class SupervisorError extends ToolFailure {
 	constructor(
 		message: string,
@@ -149,7 +153,7 @@ function inputData(input: CommandInput, pty: boolean): string {
 	let data = input.text ?? "";
 	for (const key of input.keys ?? []) {
 		const normalized = key.toUpperCase().replaceAll("-", "_");
-		const control = /^CTRL_([A-Z\[\]\\^_])$/.exec(normalized);
+		const control = /^CTRL_([A-Z[\]\\^_])$/.exec(normalized);
 		if (normalized === "ENTER") {
 			data += pty ? "\r" : "\n";
 			continue;
@@ -391,7 +395,7 @@ export class SupervisedCommand implements RunningCommand {
 		await this.ready.catch(() => undefined);
 		if (this.finalSnapshot) return this.finalSnapshot;
 		if (!this.launchAttempted && this.snapshotValue) return this.snapshotValue;
-		this.refreshPending ??= supervisorRequest(this.executor, this.key, { op: "status", cursor: this.cursor })
+		this.refreshPending ??= this.status(this.cursor)
 			.then((snapshot) => {
 				if (this.finalSnapshot) return this.finalSnapshot;
 				this.accept(snapshot);
@@ -403,12 +407,31 @@ export class SupervisedCommand implements RunningCommand {
 		return this.refreshPending;
 	}
 
+	/**
+	 * A status read. Two transient refusals are not failures: a read still in
+	 * flight when `forget` retires the supervisor (the final snapshot, already
+	 * in client memory, is the answer), and a live supervisor that briefly
+	 * refuses connections (its lease is held; the helper says "retry").
+	 */
+	private async status(cursor: number): Promise<SupervisorSnapshot> {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await supervisorRequest(this.executor, this.key, { op: "status", cursor });
+			} catch (error) {
+				if (this.finalSnapshot) return this.finalSnapshot;
+				if (!(error instanceof SupervisorError && error.code === "retry") || attempt >= STATUS_RETRIES)
+					throw error;
+				await delay(STATUS_RETRY_MS);
+			}
+		}
+	}
+
 	async output(cursor = 0): Promise<SupervisorSnapshot> {
 		await this.ready.catch(() => undefined);
 		if (this.finished && this.snapshotValue?.terminationConfirmed === false) return this.snapshotValue;
 		if (this.finalSnapshot) return this.finalSnapshot;
 		if (!this.launchAttempted && this.snapshotValue) return this.snapshotValue;
-		const snapshot = await supervisorRequest(this.executor, this.key, { op: "status", cursor });
+		const snapshot = await this.status(cursor);
 		if (this.finalSnapshot) return this.finalSnapshot;
 		// Polling and explicit reads can complete out of order; never rewind the
 		// callback cursor or overwrite newer screen/output state.

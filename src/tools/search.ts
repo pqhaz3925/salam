@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import type { Arguments, HarnessTool, ToolContext, ToolOutput } from "../contracts.ts";
 import { runAst } from "./ast-run.ts";
 import { createAstEditTools } from "./staged-ast.ts";
@@ -49,6 +49,24 @@ export async function searchPage(
 	};
 }
 
+/**
+ * ripgrep matches a glob containing `/` (`src/**`, `!ui/App.tsx`, `{src,test}/**`)
+ * against the path exactly as it was passed, so an absolute search root never
+ * matches one. Searching a directory from inside it as `.` makes such globs
+ * relative to the requested path, as callers expect; `resolve` maps the
+ * reported paths back. A file or missing root is passed through unchanged.
+ */
+async function searchRoot(
+	workspace: Workspace,
+	root: string,
+	fallbackCwd: string,
+	signal: AbortSignal,
+): Promise<{ cwd: string; target: string; resolve: (path: string) => string }> {
+	const stat = await workspace.fs.stat(root, { hash: false, signal });
+	if (stat.kind !== "dir") return { cwd: fallbackCwd, target: root, resolve: (path) => path };
+	return { cwd: root, target: ".", resolve: (path) => posix.join(root, path) };
+}
+
 export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 	const binaries = new Map<string, Promise<string>>();
 	const resolveAstGrep = (workspace: Workspace, signal: AbortSignal): Promise<string> => {
@@ -85,7 +103,13 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 			"Find matching files newest-first in the active workspace. Page with skip/limit; complete results are recoverable via artifact://.",
 		parameters: {
 			type: "object",
-			properties: { ...common, pattern: { type: "string" } },
+			properties: {
+				...common,
+				pattern: {
+					type: "string",
+					description: "ripgrep glob relative to path; supports **, {a,b} and leading ! to exclude.",
+				},
+			},
 			required: ["pattern"],
 			additionalProperties: false,
 		},
@@ -103,10 +127,11 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 			];
 			if (argBool(args, "hidden", false)) argv.push("--hidden");
 			if (!argBool(args, "gitignore", true)) argv.push("--no-ignore");
-			argv.push(root);
+			const search = await searchRoot(workspace, root, workspace.base(context.cwd), context.signal);
+			argv.push(search.target);
 			const result = await workspace.executor.exec(argv, {
 				signal: context.signal,
-				cwd: workspace.base(context.cwd),
+				cwd: search.cwd,
 				timeoutMs: 120_000,
 				maxCaptureBytes: 64 * 1024 * 1024,
 			});
@@ -120,7 +145,7 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 				result.stdout
 					.split("\n")
 					.filter(Boolean)
-					.map((path) => displayPath(workspace.base(context.cwd), path)),
+					.map((path) => displayPath(workspace.base(context.cwd), search.resolve(path))),
 			);
 		},
 	});
@@ -133,7 +158,11 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 			properties: {
 				...common,
 				pattern: { type: "string" },
-				glob: { type: "string" },
+				glob: {
+					type: "string",
+					description:
+						"File filter glob relative to path, e.g. *.ts, {src,test}/**, !ui/App.tsx (leading ! excludes).",
+				},
 				mode: { type: "string", enum: ["content", "files", "count"] },
 				case_sensitive: { type: "boolean" },
 				context: { type: "integer", minimum: 0, maximum: 20 },
@@ -168,10 +197,11 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 			if (mode === "content") argv.push("--json", `--context=${argInt(args, "context", 0, 0, 20)}`);
 			else
 				argv.push(...(mode === "files" ? ["--files-with-matches"] : ["--count-matches", "--with-filename"]));
-			argv.push(root);
+			const search = await searchRoot(workspace, root, base, context.signal);
+			argv.push(search.target);
 			const options = {
 				signal: context.signal,
-				cwd: base,
+				cwd: search.cwd,
 				timeoutMs: 180_000,
 				maxCaptureBytes: 64 * 1024 * 1024,
 			};
@@ -188,7 +218,7 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 			const rows: string[] = [];
 			for (const line of result.stdout.split("\n").filter(Boolean)) {
 				if (mode !== "content") {
-					rows.push(displayPath(base, line));
+					rows.push(displayPath(base, search.resolve(line)));
 					continue;
 				}
 				const event = JSON.parse(line) as {
@@ -204,7 +234,7 @@ export function createSearchTools(environment: ToolEnvironment): HarnessTool[] {
 					path = data.path?.text ?? Buffer.from(data.path?.bytes ?? "", "base64").toString("utf8");
 				const text = data.lines?.text ?? Buffer.from(data.lines?.bytes ?? "", "base64").toString("utf8");
 				rows.push(
-					`${displayPath(base, path)}:${data.line_number ?? 0}${event.type === "match" ? ":" : "-"} ${text.replace(/\r?\n$/, "")}`,
+					`${displayPath(base, search.resolve(path))}:${data.line_number ?? 0}${event.type === "match" ? ":" : "-"} ${text.replace(/\r?\n$/, "")}`,
 				);
 			}
 			return searchPage(environment, context, args, "grep", rows);

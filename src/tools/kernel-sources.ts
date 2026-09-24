@@ -1,5 +1,5 @@
 /** Reserve a free protocol descriptor before Node starts; inherited fd 1 is raw output. */
-export const JAVASCRIPT_LAUNCHER = String.raw`
+export const JAVASCRIPT_LAUNCHER = `
 import os, sys
 protocol = os.dup(1)
 os.set_inheritable(protocol, True)

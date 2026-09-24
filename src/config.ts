@@ -1,14 +1,14 @@
+import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve, join } from "node:path";
-import { mkdir, chmod } from "node:fs/promises";
-import { REASONING_LEVELS } from "./contracts.ts";
+import { join, resolve } from "node:path";
 import type {
+	McpServerConfig,
 	ModelChoice,
 	ProviderProfile,
-	SalamConfig,
-	McpServerConfig,
 	RemoteTarget,
+	SalamConfig,
 } from "./contracts.ts";
+import { REASONING_LEVELS } from "./contracts.ts";
 
 const builtins: Record<string, ProviderProfile> = {
 	anthropic: { kind: "anthropic" },
@@ -54,6 +54,66 @@ export function parseModel(value: string): ModelChoice {
 		throw new Error("Model must be provider/model, e.g. anthropic/claude-fable-5-1");
 	return { provider: value.slice(0, slash), model: value.slice(slash + 1) };
 }
+const MODEL_STATE = "model-state.json";
+const MODEL_STATE_DIRECTORIES = 500;
+interface ModelState {
+	last?: string;
+	directories: Record<string, { model: string; at: number }>;
+}
+async function readModelState(home: string): Promise<ModelState> {
+	try {
+		const data = object(await Bun.file(join(home, MODEL_STATE)).json(), MODEL_STATE);
+		const directories: ModelState["directories"] = Object.create(null);
+		if (data.directories && typeof data.directories === "object" && !Array.isArray(data.directories))
+			for (const [path, raw] of Object.entries(data.directories as Record<string, unknown>)) {
+				const entry = raw as { model?: unknown; at?: unknown };
+				if (raw && typeof entry.model === "string")
+					directories[path] = { model: entry.model, at: typeof entry.at === "number" ? entry.at : 0 };
+			}
+		return { ...(typeof data.last === "string" ? { last: data.last } : {}), directories };
+	} catch {
+		// Missing or unreadable state only means there is no remembered choice.
+		return { directories: Object.create(null) };
+	}
+}
+/** The model last chosen with /model in this directory, else anywhere; undefined when none is usable. */
+export async function rememberedModel(
+	home: string,
+	cwd: string,
+	providers: Record<string, ProviderProfile>,
+): Promise<ModelChoice | undefined> {
+	const state = await readModelState(home);
+	for (const value of [state.directories[cwd]?.model, state.last]) {
+		if (!value) continue;
+		try {
+			const choice = parseModel(value);
+			if (providers[choice.provider]) return choice;
+		} catch {
+			// A malformed entry is skipped, never fatal.
+		}
+	}
+	return undefined;
+}
+/** Records an explicit /model choice for this directory and as the global default for new sessions. */
+export async function rememberModel(home: string, cwd: string, selection: ModelChoice): Promise<void> {
+	const state = await readModelState(home);
+	const model = `${selection.provider}/${selection.model}`;
+	state.last = model;
+	state.directories[cwd] = { model, at: Date.now() };
+	const kept = Object.entries(state.directories)
+		.sort((a, b) => b[1].at - a[1].at)
+		.slice(0, MODEL_STATE_DIRECTORIES);
+	const path = join(home, MODEL_STATE);
+	const temporary = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	await writeFile(
+		temporary,
+		`${JSON.stringify({ last: state.last, directories: Object.fromEntries(kept) }, null, 2)}\n`,
+		{
+			mode: 0o600,
+		},
+	);
+	await rename(temporary, path);
+}
 export async function loadConfig(options: ConfigOptions = {}): Promise<SalamConfig> {
 	const cwd = resolve(options.cwd ?? process.cwd());
 	const home = resolve(options.home ?? process.env.SALAM_HOME ?? join(homedir(), ".salam"));
@@ -91,6 +151,7 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<SalamConf
 					"mcpServers",
 					"remotes",
 					"maxTurns",
+					"autoTitle",
 					"maxAgents",
 					"maxOutputTokens",
 					"contextThreshold",
@@ -191,7 +252,7 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<SalamConf
 		if (!/^[a-zA-Z0-9_-]+$/.test(name)) throw new Error(`Invalid remote name: ${name}`);
 		const remote = object(raw, `remotes.${name}`);
 		const host = text(remote.host, `${name}.host`);
-		if (host.startsWith("-") || /[\s\x00-\x1f]/.test(host)) throw new Error(`Invalid SSH host for ${name}`);
+		if (host.startsWith("-") || /[\s\p{Cc}]/u.test(host)) throw new Error(`Invalid SSH host for ${name}`);
 		const remoteCwd = text(remote.cwd, `${name}.cwd`);
 		if (!remoteCwd.startsWith("/")) throw new Error(`${name}.cwd must be an absolute remote path`);
 		remotes[name] = {
@@ -206,11 +267,15 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<SalamConf
 				: {}),
 		};
 	}
-	const selection = parseModel(
-		options.model ??
-			process.env.SALAM_MODEL ??
-			(data.model === undefined ? "anthropic/claude-fable-5-1" : text(data.model, "model")),
-	);
+	// Precedence: --model, SALAM_MODEL, the last /model choice (this directory, then any),
+	// configuration "model", then the built-in default.
+	const explicit = options.model ?? process.env.SALAM_MODEL;
+	const remembered = explicit === undefined ? await rememberedModel(home, cwd, providers) : undefined;
+	const selection =
+		remembered ??
+		parseModel(
+			explicit ?? (data.model === undefined ? "anthropic/claude-fable-5-1" : text(data.model, "model")),
+		);
 	if (!providers[selection.provider]) throw new Error(`Provider ${selection.provider} is not configured`);
 	const webSearchModel = parseModel(
 		data.webSearchModel === undefined
@@ -221,6 +286,8 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<SalamConf
 		throw new Error(`Web search provider ${webSearchModel.provider} is not configured`);
 	const reasoning = REASONING_LEVELS.find((level) => level === (data.reasoning ?? "medium"));
 	if (!reasoning) throw new Error(`reasoning must be ${REASONING_LEVELS.join(", ")}`);
+	if (data.autoTitle !== undefined && typeof data.autoTitle !== "boolean")
+		throw new Error("autoTitle must be boolean");
 	if (data.autoMemoryEnabled !== undefined && typeof data.autoMemoryEnabled !== "boolean")
 		throw new Error("autoMemoryEnabled must be boolean");
 	let autoMemoryDirectory: string | undefined;
@@ -241,10 +308,13 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<SalamConf
 		providers,
 		mcpServers,
 		remotes,
-		maxTurns: number(data.maxTurns, 50, "maxTurns", 1, 1000),
+		maxTurns: number(data.maxTurns, 500, "maxTurns", 1, 100000),
+		...(data.autoTitle === false ? { autoTitle: false } : {}),
 		maxAgents: number(data.maxAgents, 4, "maxAgents", 1, 16),
 		maxOutputTokens: number(data.maxOutputTokens, 16384, "maxOutputTokens", 128, 128000),
-		contextThreshold: number(data.contextThreshold, 120000, "contextThreshold", 4096, 10000000),
+		...(data.contextThreshold === undefined
+			? {}
+			: { contextThreshold: number(data.contextThreshold, 120000, "contextThreshold", 4096, 10000000) }),
 		reasoning,
 		autoMemorySettingsPath,
 		...(autoMemoryDisabled

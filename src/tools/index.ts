@@ -1,11 +1,11 @@
 import type { Arguments, HarnessTool, SalamConfig, ToolContext, ToolOutput } from "../contracts.ts";
-import { ArtifactStore } from "./artifacts.ts";
+import type { ArtifactStore } from "./artifacts.ts";
 import { createDebugTools } from "./debug.ts";
 import { createEvalTools } from "./eval.ts";
 import { createFileOperationTools } from "./file-ops.ts";
-import { createFileTools } from "./files.ts";
+import { createFileTools, createViewImageTool } from "./files.ts";
 import { createLspTools } from "./lsp/tools.ts";
-import type { ProcessManager } from "./processes.ts";
+import type { ProcessManager, WatchEvent } from "./processes.ts";
 import { createSearchTools } from "./search.ts";
 import { createProcessTools, createShellTool } from "./shell.ts";
 import { ToolEnvironment, type Workspace } from "./workspace.ts";
@@ -32,6 +32,8 @@ export interface ToolServices {
 	workspaceFor(context: ToolContext): Workspace;
 	/** Give programmable kernels the same validated, scoped dispatch path as direct tool calls. */
 	setToolInvoker?(invoke: (name: string, args: Arguments, context: ToolContext) => Promise<ToolOutput>): void;
+	/** Where `command_watch` events go; the runtime files them as mail and wakes the watcher. */
+	setWatchSink?(sink: (event: WatchEvent) => void): void;
 	close(): Promise<void>;
 }
 
@@ -47,15 +49,25 @@ export async function createTools(config: SalamConfig): Promise<ToolServices> {
 	const lsp = createLspTools(environment);
 	const evaluation = createEvalTools(environment);
 	const debugging = createDebugTools(environment);
+	// The full shell steers toward these tools; a restricted set without them gets the bare shell.
+	const bare =
+		config.tools !== undefined &&
+		!["read", "grep", "glob", "command_wait", "command_watch"].every((name) => config.tools!.includes(name));
+	const background = bare && ["command_output", "command_stop"].every((name) => config.tools!.includes(name));
+	const files = createFileTools(environment);
 	const tools: HarnessTool[] = [
-		...createFileTools(environment),
+		...files,
 		...createFileOperationTools(environment),
 		...createSearchTools(environment),
-		createShellTool(environment),
+		createShellTool(environment, { bare, background }),
 		...createProcessTools(environment),
 		...lsp.tools,
 		...evaluation.tools,
 		...debugging.tools,
+		// Only a restricted set asks for it; the full set already shows images through read.
+		...(config.tools?.includes("view_image")
+			? [createViewImageTool(files.find((tool) => tool.name === "read")!)]
+			: []),
 	];
 	let closed = false;
 	return {
@@ -64,6 +76,7 @@ export async function createTools(config: SalamConfig): Promise<ToolServices> {
 		processes: environment.processes,
 		workspaceFor: (context) => environment.workspace(context),
 		setToolInvoker: (invoke) => evaluation.setInvoker(invoke),
+		setWatchSink: (sink) => environment.setWatchSink(sink),
 		async close(): Promise<void> {
 			if (closed) return;
 			closed = true;
@@ -79,20 +92,23 @@ export async function createTools(config: SalamConfig): Promise<ToolServices> {
 	};
 }
 
-export { ARTIFACT_SCHEME, ArtifactStore } from "./artifacts.ts";
 export type { BoundedText, BoundOptions, StoredArtifact } from "./artifacts.ts";
+export { ARTIFACT_SCHEME, ArtifactStore } from "./artifacts.ts";
+export type { BinaryExecResult, ExecOptions, ExecResult, ProtocolProcess, RunningCommand } from "./exec.ts";
 export { Executor, LocalExecutor } from "./exec.ts";
-export type { ExecOptions, ExecResult, BinaryExecResult, RunningCommand, ProtocolProcess } from "./exec.ts";
+export type { DirEntry, FileStat, FsMutation, FsMutationObserver, WorkspaceFs } from "./fs.ts";
+export { LocalFs, observeMutations, RemoteFs, readTextFile, unobserved } from "./fs.ts";
 export type {
 	ProcessInfo,
 	ProcessManager,
 	ProcessOutput,
 	ProcessState,
 	ReadinessCondition,
+	WatchEvent,
+	WatchSpec,
 } from "./processes.ts";
-export type { CommandInput, TerminalScreen } from "./supervised-command.ts";
-export { LocalFs, observeMutations, RemoteFs, readTextFile, unobserved } from "./fs.ts";
-export type { DirEntry, FileStat, FsMutation, FsMutationObserver, WorkspaceFs } from "./fs.ts";
+export { describeWatchEvent, longestSleep } from "./shell.ts";
 export { connectionKey, RemoteExecutor, validateTarget } from "./ssh.ts";
+export type { CommandInput, TerminalScreen } from "./supervised-command.ts";
 export { unifiedDiff } from "./text.ts";
 export { defineTool, displayPath, ToolEnvironment, Workspace } from "./workspace.ts";

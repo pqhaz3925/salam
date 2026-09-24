@@ -1,4 +1,3 @@
-import { streamSimple } from "@oh-my-pi/pi-ai";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -6,6 +5,7 @@ import type {
 	ProviderSessionState,
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import { normalizeOpenAIPromptCacheKey } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type {
@@ -14,11 +14,10 @@ import type {
 	ProviderEvent,
 	ProviderGateway,
 	ProviderRequest,
-	ProviderUsage,
 	SalamConfig,
 } from "../contracts";
-import { type Credential, Credentials } from "./auth";
 import { anthropicStream, compactAnthropic, contextFor } from "./anthropic";
+import { type Credential, Credentials } from "./auth";
 import { dynamicAnthropic, Models, profileFor } from "./models";
 import { fetchProviderUsage, usageFetchers, usageUnavailable } from "./usage";
 import { nativeWebFetch, nativeWebSearch } from "./web";
@@ -174,11 +173,14 @@ export async function createProviderGateway(config: SalamConfig): Promise<Provid
 			);
 			return { selection, message };
 		},
-		async models() {
+		async models(options = {}) {
 			shutdown.signal.throwIfAborted();
+			const providers = Object.entries(config.providers).filter(
+				([provider]) => options.provider === undefined || provider === options.provider,
+			);
 			const groups = await Promise.all(
-				Object.entries(config.providers).map(async ([provider, profile]) => {
-					if (profile.kind === "devin" || profile.kind === "openai-codex") {
+				providers.map(async ([provider, profile]) => {
+					if (!options.offline && (profile.kind === "devin" || profile.kind === "openai-codex")) {
 						try {
 							const credential = await credentials.resolve(provider, profile, shutdown.signal);
 							if (profile.kind === "devin")

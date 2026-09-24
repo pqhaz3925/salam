@@ -72,7 +72,7 @@ export function createDebugTools(environment: ToolEnvironment): {
 			});
 			if (check.code !== 0)
 				throw new ToolFailure(
-					`debugpy is unavailable in ${python} on ${workspace.label}. Install debugpy into that interpreter (prefer a dedicated venv), then supply adapter_command: [\"/path/to/venv/bin/python\",\"-m\",\"debugpy.adapter\"]. No packages are installed automatically.\n${check.stderr}`,
+					`debugpy is unavailable in ${python} on ${workspace.label}. Install debugpy into that interpreter (prefer a dedicated venv), then supply adapter_command: ["/path/to/venv/bin/python","-m","debugpy.adapter"]. No packages are installed automatically.\n${check.stderr}`,
 				);
 			return { adapter, command: [python, "-m", "debugpy.adapter"] };
 		}

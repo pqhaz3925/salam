@@ -1,7 +1,7 @@
-import Ajv from "ajv";
 import type { ValidateFunction } from "ajv";
-import { REASONING_LEVELS } from "../contracts.ts";
+import Ajv from "ajv";
 import type { HistoryEntry } from "../contracts.ts";
+import { REASONING_LEVELS } from "../contracts.ts";
 import type {
 	AuxUsageRecord,
 	FileMutationInput,
@@ -82,6 +82,7 @@ const sessionRequired = [
 const sessionProperties = {
 	id: string,
 	title: string,
+	titleSource: { enum: ["user", "generated"] },
 	cwd: string,
 	localCwd: string,
 	remote: string,
@@ -270,7 +271,7 @@ export const auxUsageSchema = ajv.compile<AuxUsageRecord>({
 	type: "object",
 	required: ["kind", "usage", "selection", "timestamp"],
 	properties: {
-		kind: { enum: ["recap", "compaction", "web_fetch", "web_search"] },
+		kind: { enum: ["recap", "compaction", "web_fetch", "web_search", "title"] },
 		selection: modelChoice,
 		timestamp: number,
 		usage: {

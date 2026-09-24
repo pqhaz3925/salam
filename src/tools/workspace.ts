@@ -1,11 +1,11 @@
 import { homedir } from "node:os";
-import { join, posix, resolve } from "node:path";
+import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Arguments, HarnessTool, SalamConfig, ToolContext, ToolOutput } from "../contracts.ts";
 import { ArtifactStore } from "./artifacts.ts";
 import { type Executor, LocalExecutor } from "./exec.ts";
 import { LocalFs, RemoteFs, type WorkspaceFs } from "./fs.ts";
-import { ProcessRegistry } from "./processes.ts";
+import { ProcessRegistry, type WatchEvent, type WatchSpec } from "./processes.ts";
 import { connectionKey, RemoteExecutor } from "./ssh.ts";
 import { errorText, ToolFailure } from "./util.ts";
 
@@ -132,7 +132,22 @@ export class FreshnessTracker {
 				if (++removed >= SNAPSHOT_EVICTION) break;
 			}
 		}
-		this.entries.set(FreshnessTracker.key(context, workspaceId, path), { hash, size, at: Date.now() });
+		const key = FreshnessTracker.key(context, workspaceId, path);
+		// Re-inserted so iteration order is recency order for `recent`.
+		this.entries.delete(key);
+		this.entries.set(key, { hash, size, at: Date.now() });
+	}
+
+	/** Paths this agent observed on one workspace, most recently observed first. */
+	recent(context: ToolContext, workspaceId: string, limit: number): string[] {
+		const prefix = FreshnessTracker.key(context, workspaceId, "");
+		const paths: string[] = [];
+		for (const key of [...this.entries.keys()].reverse()) {
+			if (!key.startsWith(prefix)) continue;
+			paths.push(key.slice(prefix.length));
+			if (paths.length >= limit) break;
+		}
+		return paths;
 	}
 
 	get(context: ToolContext, workspaceId: string, path: string): Snapshot | undefined {
@@ -149,6 +164,12 @@ export class ToolEnvironment {
 	readonly freshness = new FreshnessTracker();
 	/** Background commands, bound to the workspaces below and closed before them. */
 	readonly processes: ProcessRegistry;
+	/**
+	 * Where watch events go: the runtime files them as mail for the owning
+	 * session and wakes it. Unset (bare tool hosts), watching is unavailable.
+	 */
+	private watchSink: ((event: WatchEvent) => void) | undefined;
+	private readonly watches = new Map<string, { cancel(): void }>();
 	private readonly workspaces = new Map<string, Workspace>();
 	private readonly localBinDirs: string[];
 	private closed = false;
@@ -164,6 +185,65 @@ export class ToolEnvironment {
 			join(config.home, "processes"),
 			(remote) => this.workspace({ remote }).executor,
 		);
+	}
+
+	/**
+	 * Connects watch events to the runtime and re-arms the watches saved for
+	 * recovered jobs, so a watch set before a restart still fires (a job that
+	 * ended meanwhile reports its exit at once).
+	 */
+	setWatchSink(sink: (event: WatchEvent) => void): void {
+		this.watchSink = sink;
+		for (const { id, spec } of this.processes.savedWatches()) {
+			try {
+				this.watchJob(id, spec);
+			} catch {
+				// Its output is gone (e.g. the supervisor could not be reattached): drop the watch.
+				this.processes.saveWatch(id, undefined);
+			}
+		}
+	}
+
+	/**
+	 * Starts (or replaces) the one watch a job may have; events go to the sink.
+	 * The spec is saved beside the job's recovery record and advanced as events
+	 * fire, so a restart neither loses the watch nor repeats what was reported.
+	 */
+	watchJob(id: string, spec: WatchSpec): void {
+		const sink = this.watchSink;
+		if (!sink) throw new ToolFailure("Watching background commands needs the salam runtime.");
+		this.watches.get(id)?.cancel();
+		const handle = this.processes.watch(id, spec, (event) => {
+			const last = event.kind === "exit" || (!spec.repeat && !spec.exit);
+			const current = this.watches.get(id) === handle;
+			if (last && current) this.watches.delete(id);
+			sink(event);
+			// A replaced watch owns nothing on disk any more.
+			if (!current) return;
+			// Delivered first, then advanced: a crash in between repeats an event rather than losing it.
+			const next = last
+				? undefined
+				: spec.repeat
+					? { ...spec, cursor: event.cursor }
+					: { ...spec, log: undefined, cursor: event.cursor };
+			try {
+				this.processes.saveWatch(id, next);
+			} catch {
+				/* Persistence is best effort; the live watch continues regardless. */
+			}
+		});
+		this.watches.set(id, handle);
+		this.processes.saveWatch(id, spec);
+	}
+
+	/** Ends a job's watch; false when it had none. */
+	unwatchJob(id: string): boolean {
+		const handle = this.watches.get(id);
+		this.processes.saveWatch(id, undefined);
+		if (!handle) return false;
+		handle.cancel();
+		this.watches.delete(id);
+		return true;
 	}
 
 	workspace(context: Pick<ToolContext, "remote">): Workspace {

@@ -27,6 +27,7 @@
         "tree-sitter-rust": "0.24.0",
         "tree-sitter-typescript": "0.23.2",
         "typescript-language-server": "6.0.0",
+        "web-tree-sitter": "0.25.10",
       },
       "devDependencies": {
         "@biomejs/biome": "2.5.14",

@@ -156,9 +156,10 @@ test("a promoted foreground command keeps its process and output and outlives it
 	// `two` is printed only after the default foreground deadline has passed:
 	// it arrives only if promotion really lifted that deadline.
 	const running = jobs.run(
-		foreground("echo $$; sleep 1.5; echo two; sleep 30", {
+		// The deadline leaves room for promotion under a loaded (parallel) run.
+		foreground("echo $$; sleep 3; echo two; sleep 30", {
 			signal: controller.signal,
-			timeoutMs: 500,
+			timeoutMs: 2_000,
 			keepDeadline: false,
 			onOutput: (chunk) => {
 				streamed += chunk;
@@ -478,3 +479,25 @@ test("PTY teardown includes TERM-resistant job-control groups in its owned sessi
 	expect(stopped.job.state).toBe("cancelled");
 	expect(stopped.job.terminationConfirmed).toBe(true);
 }, 20_000);
+
+test("reads racing a command's completion never fail as the supervisor retires", async () => {
+	const start = await prepare();
+	// Reads in flight while the finished command's supervisor is forgotten (or
+	// briefly refusing connections) must return the final output, not an error:
+	// a command_watch that hit such an error used to lose the exit event.
+	const jobs = [start("sleep 0.3; echo done-a"), start("sleep 0.35; echo done-b")];
+	const failures: string[] = [];
+	const reads: Promise<unknown>[] = [];
+	const end = Date.now() + 1_500;
+	while (Date.now() < end) {
+		for (const job of jobs)
+			reads.push(registry!.read(job.id).catch((error: unknown) => failures.push(String(error))));
+		await Bun.sleep(10);
+	}
+	await Promise.all(reads);
+	expect(failures).toEqual([]);
+	for (const [index, job] of jobs.entries()) {
+		const output = await registry!.read(job.id);
+		expect(output.text).toContain(`done-${"ab"[index]}`);
+	}
+});

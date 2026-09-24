@@ -1,8 +1,8 @@
-import { StyledText } from "@opentui/core";
 import type { TextChunk } from "@opentui/core";
+import { StyledText } from "@opentui/core";
 import type { TodoItem } from "../contracts.ts";
-import { accent, bold, danger, faint, glyph, muted, ok, plain, text, warn } from "./theme.ts";
 import { truncate, wrapText } from "./text.ts";
+import { accent, bold, danger, faint, glyph, muted, ok, plain, text, warn } from "./theme.ts";
 
 type Tone = (value: string) => TextChunk;
 

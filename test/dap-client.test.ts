@@ -1,9 +1,9 @@
+import { expect, test } from "bun:test";
 import { ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { expect, test } from "bun:test";
 import { DapClient } from "../src/tools/dap-client.ts";
 
 async function fixture() {

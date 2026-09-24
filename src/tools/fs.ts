@@ -3,14 +3,14 @@ import { Buffer } from "node:buffer";
 import { lstat, readdir, stat as statFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
-	chmodGuarded,
-	chmodDirectoryGuarded,
 	type CommittedFile,
+	chmodDirectoryGuarded,
+	chmodGuarded,
 	mkdirAtomic,
-	rmdirAtomic,
 	moveAtomic,
 	removeAtomic,
 	requireExpectedHash,
+	rmdirAtomic,
 	writeAtomic,
 } from "./atomic-io.ts";
 import type { RemoteExecutor } from "./ssh.ts";
@@ -116,8 +116,20 @@ export type FsMutation = (
  * The observer sees the operation before it runs, so it can record what is
  * about to be destroyed, and refuse a change it would not be able to undo.
  */
+/** One side of a change made outside any `WorkspaceFs` call, with the full bytes it held. */
+export type ExternalState = { kind: "missing" } | { kind: "file"; bytes: Uint8Array; mode?: number };
+
+/** A change a command already made through its own channel (a shell `sed -i`), observed after the fact. */
+export interface ExternalChange {
+	path: string;
+	before: ExternalState;
+	after: ExternalState;
+}
+
 export interface FsMutationObserver {
 	observe<T>(fs: WorkspaceFs, mutation: FsMutation, apply: () => Promise<T>): Promise<T>;
+	/** Records changes that already happened; unlike `observe`, nothing can be refused. */
+	external?(fs: WorkspaceFs, changes: ExternalChange[]): void;
 }
 
 /**
@@ -136,6 +148,11 @@ export function observeMutations<T>(observer: FsMutationObserver, body: () => Pr
 /** Runs `body` outside any observer: putting a snapshot back is not a new mutation. */
 export function unobserved<T>(body: () => Promise<T>): Promise<T> {
 	return mutationScope.exit(body);
+}
+
+/** Hands after-the-fact changes to the observer of the current call, if there is one. */
+export function reportExternalChanges(fs: WorkspaceFs, changes: ExternalChange[]): void {
+	if (changes.length > 0) mutationScope.getStore()?.external?.(fs, changes);
 }
 
 function observed<T>(fs: WorkspaceFs, mutation: FsMutation, apply: () => Promise<T>): Promise<T> {

@@ -1,9 +1,9 @@
 import { mkdir } from "node:fs/promises";
 import { join, posix, resolve } from "node:path";
 import type { ToolContext } from "../contracts.ts";
-import type { Workspace } from "../tools/workspace.ts";
 import type { ExecResult } from "../tools/exec.ts";
-import { RemoteExecutor, connectionKey } from "../tools/ssh.ts";
+import { connectionKey, RemoteExecutor } from "../tools/ssh.ts";
+import type { Workspace } from "../tools/workspace.ts";
 import type { Store, WorktreeRecord } from "./store.ts";
 
 export class Worktrees {

@@ -327,13 +327,13 @@ test("byte limits use UTF-8 bytes without splitting characters, and apply only t
 	expect(full.isError).not.toBe(true);
 	expect((await memory.context(context)).content).toBe(exact);
 	expect((await memory.context(context)).truncated).toBe(false);
-	const content = "a" + "🙂".repeat(6400);
+	const content = `a${"🙂".repeat(6400)}`;
 	const over = await memory.tool.execute({ op: "write", content }, context);
 	expect(over.isError).toBe(true);
 	expect(details(over).indexBytes).toBe(25 * 1024 + 1);
 	const bounded = await memory.context({ ...context, sessionId: "unicode" });
 	expect(bounded.truncated).toBe(true);
-	expect(bounded.content).toBe("a" + "🙂".repeat(6399));
+	expect(bounded.content).toBe(`a${"🙂".repeat(6399)}`);
 	expect(bounded.content).not.toContain("\uFFFD");
 	const topic = await memory.tool.execute({ op: "write", path: "reference.md", content }, context);
 	expect(topic.isError).not.toBe(true);

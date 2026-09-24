@@ -1,10 +1,10 @@
+import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
 import { loadConfig } from "../src/config.ts";
-import { createMcpTools } from "../src/integrations/mcp-tools.ts";
 import { McpHub } from "../src/integrations/mcp.ts";
+import { createMcpTools } from "../src/integrations/mcp-tools.ts";
 
 test("MCP server discovery lists an empty registry but rejects an unknown named server", async () => {
 	const root = await mkdtemp(join(tmpdir(), "salam-mcp-status-"));

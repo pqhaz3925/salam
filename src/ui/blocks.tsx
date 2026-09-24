@@ -1,10 +1,13 @@
-import { CodeRenderable, StyledText } from "@opentui/core";
 import type { MarkdownRenderable, OnHighlightCallback, Renderable, TextChunk } from "@opentui/core";
-import { For, Show, createEffect, createMemo, on } from "solid-js";
+import { bg, CodeRenderable, fg, StyledText } from "@opentui/core";
+import { createEffect, createMemo, For, on, Show } from "solid-js";
 import type { ModelChoice, ViewItem } from "../contracts.ts";
-import { diffFenceHighlights, parseUnifiedDiff } from "./diff.ts";
+import { classifyShell } from "../tools/shell-kind.ts";
+import { SYNTAX_ERRORS } from "../tools/syntax-check.ts";
 import type { DiffRow } from "./diff.ts";
+import { diffFenceHighlights, parseUnifiedDiff } from "./diff.ts";
 import { StyledLine } from "./styled.tsx";
+import { flatten, truncate } from "./text.ts";
 import {
 	bold,
 	danger,
@@ -13,6 +16,7 @@ import {
 	italic,
 	muted,
 	ok,
+	palette,
 	plain,
 	syntaxStyle,
 	text,
@@ -20,11 +24,20 @@ import {
 	user,
 	warn,
 } from "./theme.ts";
-import { flatten, truncate } from "./text.ts";
 
 /** Collapsed failures keep this many trailing output lines in view. */
 const ERROR_TAIL_LINES = 4;
-const EXPAND_HINT = "(ctrl+o tool output)";
+/** Collapsed results show this many leading output lines, as Claude Code does. */
+const OUTPUT_LINES = 3;
+/** Collapsed diffs show this many rows before the expand hint. */
+const DIFF_ROWS = 12;
+const EXPAND_HINT = "(ctrl+o to expand)";
+/** How the shell tool opens its report of files that changed on disk. */
+const CHANGED_FILES = "[files you had seen changed on disk while this command ran:";
+const addedBg = bg(palette.addedBg);
+const addedText = fg(palette.added);
+const removedText = fg(palette.removed);
+const removedBg = bg(palette.removedBg);
 
 /**
  * Argument keys that name what a call acts on, most telling first. The first
@@ -33,9 +46,9 @@ const EXPAND_HINT = "(ctrl+o tool output)";
  */
 const TARGET_KEYS = [
 	"command",
-	"path",
 	"pattern",
 	"query",
+	"path",
 	"url",
 	"uri",
 	"server",
@@ -60,9 +73,10 @@ export function modelTag(selection?: ModelChoice): string {
 	return `${selection.provider}/${selection.label ?? selection.model}`;
 }
 
+/** The user's message on a tinted full-width band, as Claude Code shows it. */
 export function UserBlock(props: { text: string }) {
 	return (
-		<box flexDirection="column" width="100%" marginTop={1}>
+		<box flexDirection="column" width="100%" marginTop={1} backgroundColor={palette.userBg}>
 			<For each={props.text.replace(/\s+$/, "").split("\n")}>
 				{(line, index) => (
 					<StyledLine
@@ -148,8 +162,10 @@ function ThinkingBlock(props: { text: string; spaced: boolean }) {
 	});
 	return (
 		<box flexDirection="column" width="100%" marginBottom={props.spaced ? 1 : 0}>
-			<StyledLine wrapMode="none" content={new StyledText([faint("thinking")])} />
-			<StyledLine wrapMode="word" width="100%" content={content()} />
+			<StyledLine wrapMode="none" content={new StyledText([italic(thinking("\u2234 Thinking\u2026"))])} />
+			<box width="100%" paddingLeft={2}>
+				<StyledLine wrapMode="word" width="100%" content={content()} />
+			</box>
 		</box>
 	);
 }
@@ -175,25 +191,72 @@ export function NoticeBlock(props: { text: string; error: boolean; width: number
 	);
 }
 
-function diffRowChunks(row: DiffRow): TextChunk[] {
-	const gutter = (value: number | undefined) =>
-		faint(value === undefined ? "     " : String(value).padStart(5));
+/**
+ * One diff row: line number, then the line on a green or red band for additions and removals,
+ * padded to `width` so the band reads as a row, as in Claude Code.
+ */
+function diffRowChunks(row: DiffRow, width: number): TextChunk[] {
+	const gutter = (value: number | undefined) => (value === undefined ? "    " : String(value).padStart(4));
 	if (row.kind === "file") return [muted(row.text)];
 	if (row.kind === "meta") return [faint(row.text)];
-	if (row.kind === "hunk") return [faint(glyph.ellipsis)];
-	if (row.kind === "add") return [gutter(row.newLine), ok(` + ${row.text}`)];
-	if (row.kind === "del") return [gutter(row.oldLine), danger(` - ${row.text}`)];
-	return [gutter(row.newLine), text(`   ${row.text}`)];
+	if (row.kind === "hunk") return [faint(`   ${glyph.ellipsis}`)];
+	const tabs = row.text.replace(/\t/g, "  ");
+	if (row.kind === "context") return [faint(gutter(row.newLine)), text(`   ${tabs}`)];
+	const added = row.kind === "add";
+	const band = added ? addedBg : removedBg;
+	const body = `${gutter(added ? row.newLine : row.oldLine)} ${added ? "+" : "-"} ${tabs}`;
+	return [band((added ? addedText : removedText)(body.length < width ? body.padEnd(width) : body))];
 }
 
-/** Rows hung under a tool header: `└` on the first, an aligned indent on the rest. */
+/** Rows hung under a tool header: `⎿` on the first, an aligned indent on the rest. */
 function hanging(rows: TextChunk[][]): StyledText {
 	const chunks: TextChunk[] = [];
 	for (let index = 0; index < rows.length; index += 1) {
 		if (index > 0) chunks.push(plain("\n"));
-		chunks.push(faint(index === 0 ? `${glyph.branch} ` : "  "), ...rows[index]!);
+		chunks.push(faint(index === 0 ? `${glyph.branch}  ` : "   "), ...rows[index]!);
 	}
 	return new StyledText(chunks);
+}
+
+/**
+ * Drops hunk markers that open a diff or a file (nothing precedes them to elide) and the blank
+ * row a final newline leaves.
+ */
+function trimDiff(rows: DiffRow[]): DiffRow[] {
+	const kept = rows.filter(
+		(row, index) => row.kind !== "hunk" || (index > 0 && rows[index - 1]!.kind !== "file"),
+	);
+	const last = kept.at(-1);
+	return last?.kind === "context" && last.text.length === 0 ? kept.slice(0, -1) : kept;
+}
+
+/** The runtime's todo listing, `1. [status] text`, as a checklist. */
+function todoRows(lines: string[]): TextChunk[][] | undefined {
+	const rows: TextChunk[][] = [];
+	for (const line of lines) {
+		const item = /^\d+\. \[(\w+)\] (.*)$/.exec(line);
+		if (!item) return undefined;
+		const [, status, content] = item;
+		rows.push(
+			status === "completed"
+				? [ok("\u2713 "), faint(content!)]
+				: status === "in_progress"
+					? [warn(`${glyph.todoActive} `), bold(text(content!))]
+					: status === "blocked" || status === "abandoned"
+						? [danger(`${glyph.todoBlocked} `), muted(content!)]
+						: [muted("\u25a1 "), text(content!)],
+		);
+	}
+	return rows.length > 0 ? rows : undefined;
+}
+
+/** `web_search` → `WebSearch`: tool names read like Claude Code's `Bash(…)` and `Read(…)`. */
+function displayName(name: string): string {
+	return name
+		.split(/[_\s-]+/)
+		.filter(Boolean)
+		.map((part) => part[0]!.toUpperCase() + part.slice(1))
+		.join("");
 }
 
 /** The call's recorded arguments; the runtime stores them as JSON in `details`. */
@@ -219,6 +282,15 @@ function scalarArgument(args: ToolArguments, key: string): string | undefined {
 /** What a call acts on, built only from its real arguments, plus the keys it consumed. */
 function toolTarget(args: ToolArguments | undefined): { label: string; keys: string[] } | undefined {
 	if (!args) return undefined;
+	// batch_edit: the files it changes.
+	if (Array.isArray(args.files)) {
+		const paths = args.files.flatMap((file) =>
+			file && typeof file === "object" && typeof (file as { path?: unknown }).path === "string"
+				? [(file as { path: string }).path]
+				: [],
+		);
+		if (paths.length > 0) return { label: paths.join(", "), keys: [] };
+	}
 	const key =
 		TARGET_KEYS.find((name) => scalarArgument(args, name) !== undefined) ??
 		Object.keys(args).find(
@@ -268,10 +340,15 @@ function argumentRows(key: string, value: unknown): TextChunk[][] {
 	return [[faint(`${key}:`)], ...lines.map((line) => [faint(`  ${line}`)])];
 }
 
+function plural(count: number, word: string): string {
+	return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
 /**
- * A tool call as one compact action row: status dot, tool name and target.
- * Collapsed, the result is a one-line summary (failures keep their last lines);
- * expanded, every argument, retained output line and diff row is shown.
+ * A tool call in Claude Code's shape: `● Name(target)`, then its result hung under `⎿`.
+ * Collapsed, the result shows its first lines (failures their last ones) and any diff on
+ * tinted rows, each cut short with an expand hint; expanded, every argument, output line
+ * and diff row is shown.
  */
 export function ToolBlock(props: { item: ViewItem; width: number; expanded: boolean }) {
 	const args = createMemo(() => toolArguments(props.item.details));
@@ -285,68 +362,115 @@ export function ToolBlock(props: { item: ViewItem; width: number; expanded: bool
 		const values = args();
 		const command = values ? scalarArgument(values, "command") : undefined;
 		const first = lines()[0];
-		return command !== undefined && first !== undefined && first.endsWith(`$ ${command.split("\n", 1)[0]}`)
-			? lines().slice(1)
-			: lines();
+		let rest = command && first?.endsWith(`$ ${command.split("\n", 1)[0]}`) ? lines().slice(1) : lines();
+		// The shell's report of changed files repeats, for the model, the diff drawn below.
+		const report = rest.findIndex((line) => line.startsWith(CHANGED_FILES));
+		if (report >= 0) rest = rest.slice(0, report);
+		rest = rest.filter((line) => !line.startsWith(SYNTAX_ERRORS));
+		// With a diff to show, the shell's "(no output)" placeholder says nothing.
+		if (props.item.diff && rest.length === 1 && rest[0]!.trim() === "(no output)") rest = [];
+		// Leading blank lines would leave the `⎿` pointing at nothing.
+		const start = rest.findIndex((line) => line.trim().length > 0);
+		return start < 0 ? [] : rest.slice(start);
 	});
 	const diff = createMemo(() => (props.item.diff ? parseUnifiedDiff(props.item.diff) : undefined));
+	/** Files the command left unparseable: always shown, never folded away. */
+	const syntax = createMemo(() => {
+		const line = lines().find((candidate) => candidate.startsWith(SYNTAX_ERRORS));
+		return line?.slice(SYNTAX_ERRORS.length, -1).trim();
+	});
 	const state = () => props.item.state ?? "done";
 	const json = createMemo(() => (state() === "done" ? jsonSummary(output()) : undefined));
-	/** Header columns left for the target after the dot, the name and their spacing. */
-	const labelRoom = () => props.width - (props.item.name ?? "tool").length - 3;
+	const name = createMemo(() => displayName(props.item.name ?? "tool"));
+	/** A shell call labelled by what it does (`Read(a.ts)`), when that is recognisable. */
+	const kind = createMemo(() => {
+		const command = props.item.name === "shell" ? scalarArgument(args() ?? {}, "command") : undefined;
+		return command ? classifyShell(command, props.item.text) : undefined;
+	});
+	/** Header columns left for the target after the dot, the name, the space and the parentheses. */
+	const labelRoom = () => props.width - name().length - 4;
+	/** Columns right of the `⎿` gutter, for diff bands. */
+	const bodyWidth = () => Math.max(8, props.width - 5);
 
 	const header = () => {
 		const dot =
-			state() === "error"
-				? danger(glyph.tool)
-				: state() === "running"
-					? warn(glyph.toolRunning)
-					: ok(glyph.tool);
+			state() === "error" ? danger(glyph.tool) : state() === "running" ? faint(glyph.tool) : ok(glyph.tool);
+		const chunks: TextChunk[] = [dot, plain(" ")];
+		const parts = kind();
+		if (parts) {
+			let room = props.width - 2;
+			for (const [index, part] of parts.entries()) {
+				const lead = index > 0 ? " \u00b7 " : "";
+				const verb = truncate(part.verb, room - lead.length);
+				if (verb.length === 0) break;
+				chunks.push(faint(lead), bold(text(verb)));
+				room -= lead.length + verb.length;
+				const label = flatten(part.target);
+				if (label.length > 0 && room > 3) {
+					const shown = truncate(label, room - 2);
+					chunks.push(text(`(${shown})`));
+					room -= shown.length + 2;
+				}
+			}
+			return new StyledText(chunks);
+		}
 		const label = target()?.label ?? "";
-		const chunks: TextChunk[] = [
-			dot,
-			plain(" "),
-			bold(text(truncate(props.item.name ?? "tool", props.width - 2))),
-		];
-		if (label.length > 0 && labelRoom() > 1) chunks.push(plain(" "), text(truncate(label, labelRoom())));
+		chunks.push(bold(text(truncate(name(), props.width - 2))));
+		if (label.length > 0 && labelRoom() > 1)
+			chunks.push(text("("), text(truncate(label, labelRoom())), text(")"));
 		return new StyledText(chunks);
 	};
 
+	const hint = (hidden: number): TextChunk[] =>
+		hidden > 0
+			? [faint(`${glyph.ellipsis} +${hidden} lines ${EXPAND_HINT}`)]
+			: [faint(`${glyph.ellipsis} ${EXPAND_HINT}`)];
+
 	const summaryRows = (): TextChunk[][] => {
 		const shown = output();
-		const room = Math.max(1, props.width - 4);
+		const room = Math.max(1, props.width - 5);
 		if (state() === "running") {
-			for (let index = shown.length - 1; index >= 0; index -= 1)
-				if (shown[index]!.trim().length > 0) return [[faint(truncate(flatten(shown[index]!), room))]];
-			return [];
+			const tail = shown.filter((line) => line.trim().length > 0).slice(-OUTPUT_LINES);
+			return tail.map((line) => [faint(truncate(flatten(line), room))]);
 		}
-		const firstIndex = shown.findIndex((line) => line.trim().length > 0);
-		const summary = json() ?? (firstIndex >= 0 ? flatten(shown[firstIndex]!) : "");
-		const hidden = json() === undefined ? Math.max(0, shown.length - 1) : 0;
+		const todos = props.item.name === "todo" ? todoRows(shown) : undefined;
+		if (todos) return todos;
+		// A file read is summarised by its header line (path, length, range), as Claude Code does.
+		if (props.item.name === "read" && shown.length > 1)
+			return [[text(truncate(shown[0]!, room))], hint(shown.length - 1)];
+		const rows: TextChunk[][] = [];
+		let hidden = 0;
+		const summary = json();
+		if (summary !== undefined) rows.push([text(summary)]);
+		else {
+			for (const line of shown.slice(0, OUTPUT_LINES))
+				rows.push([text(truncate(line.replace(/\t/g, "  "), room))]);
+			hidden += Math.max(0, shown.length - OUTPUT_LINES);
+		}
+		const broken = syntax();
+		if (broken) rows.push([danger(`Syntax errors: ${broken}`)]);
 		const parsed = diff();
-		const stat = parsed ? `+${parsed.added} -${parsed.removed}` : "";
-		const more = hidden > 0 || json() !== undefined || (parsed?.rows.length ?? 0) > 0;
-		const hint = more ? `${hidden > 0 ? `${glyph.ellipsis} +${hidden} lines ` : ""}${EXPAND_HINT}` : "";
-		const reserved = (stat.length > 0 ? stat.length + 2 : 0) + (hint.length > 0 ? hint.length + 2 : 0);
-		const chunks: TextChunk[] = [];
-		if (summary.length > 0) chunks.push(muted(truncate(summary, Math.max(8, room - reserved))));
-		if (parsed)
-			chunks.push(
-				plain(chunks.length > 0 ? "  " : ""),
-				ok(`+${parsed.added}`),
-				plain(" "),
-				danger(`-${parsed.removed}`),
-			);
-		if (hint.length > 0) chunks.push(faint(`${chunks.length > 0 ? "  " : ""}${hint}`));
-		return chunks.length > 0 ? [chunks] : [];
+		if (parsed) {
+			const files = parsed.files.length;
+			rows.push([
+				muted(
+					`${files > 1 ? `${files} files, ` : ""}${plural(parsed.added, "addition")} and ${plural(parsed.removed, "removal")}`,
+				),
+			]);
+			const body = trimDiff(parsed.rows.filter((row) => files > 1 || row.kind !== "file"));
+			for (const row of body.slice(0, DIFF_ROWS)) rows.push(diffRowChunks(row, bodyWidth()));
+			hidden += Math.max(0, body.length - DIFF_ROWS);
+		}
+		if (hidden > 0 || (summary !== undefined && shown.length > 0)) rows.push(hint(hidden));
+		return rows;
 	};
 
 	const errorRows = (): TextChunk[][] => {
 		const tail = output().slice(-ERROR_TAIL_LINES);
 		const hidden = output().length - tail.length;
 		const rows: TextChunk[][] = [];
-		if (hidden > 0) rows.push([faint(`${glyph.ellipsis} +${hidden} lines ${EXPAND_HINT}`)]);
 		for (const line of tail) rows.push([danger(line)]);
+		if (hidden > 0) rows.push(hint(hidden));
 		return rows;
 	};
 
@@ -355,7 +479,8 @@ export function ToolBlock(props: { item: ViewItem; width: number; expanded: bool
 		const values = args();
 		const parsed = diff();
 		if (values) {
-			const consumed = (target()?.label.length ?? 0) <= labelRoom() ? (target()?.keys ?? []) : [];
+			// A classified shell header no longer shows the command itself, so it is listed here.
+			const consumed = !kind() && (target()?.label.length ?? 0) <= labelRoom() ? (target()?.keys ?? []) : [];
 			for (const [key, value] of Object.entries(values)) {
 				const exact = typeof value !== "string" || flatten(value) === value;
 				// The header already shows this value verbatim.
@@ -368,8 +493,8 @@ export function ToolBlock(props: { item: ViewItem; width: number; expanded: bool
 		const tone = state() === "error" ? danger : text;
 		for (const line of lines()) rows.push([tone(line)]);
 		if (parsed) {
-			rows.push([ok(`+${parsed.added}`), plain(" "), danger(`-${parsed.removed}`)]);
-			for (const row of parsed.rows) rows.push(diffRowChunks(row));
+			rows.push([muted(`${plural(parsed.added, "addition")} and ${plural(parsed.removed, "removal")}`)]);
+			for (const row of trimDiff(parsed.rows)) rows.push(diffRowChunks(row, bodyWidth()));
 		}
 		return rows;
 	};

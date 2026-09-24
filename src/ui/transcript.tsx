@@ -1,5 +1,5 @@
-import { For, Match, Switch, batch, createMemo, createSignal } from "solid-js";
 import type { Accessor, Setter } from "solid-js";
+import { batch, createMemo, createSignal, For, Match, Switch } from "solid-js";
 import type { AppSnapshot, ViewItem } from "../contracts.ts";
 import { AssistantBlock, NoticeBlock, ToolBlock, UserBlock } from "./blocks.tsx";
 

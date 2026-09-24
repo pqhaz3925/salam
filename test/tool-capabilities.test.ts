@@ -1,16 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import type { Json, ToolContext, ToolOutput } from "../src/contracts.ts";
 import { createFileTools } from "../src/tools/files.ts";
-import { createSearchTools } from "../src/tools/search.ts";
 import { pathToUri } from "../src/tools/lsp/manager.ts";
 import { commitEditPlan, planWorkspaceEdit } from "../src/tools/lsp/transaction.ts";
+import { createSearchTools } from "../src/tools/search.ts";
 import { unifiedDiff } from "../src/tools/text.ts";
-import { ToolEnvironment } from "../src/tools/workspace.ts";
 import { ToolFailure } from "../src/tools/util.ts";
+import { ToolEnvironment } from "../src/tools/workspace.ts";
 
 function details(output: ToolOutput): Record<string, Json> {
 	if (!output.details || typeof output.details !== "object" || Array.isArray(output.details))
@@ -48,7 +48,7 @@ test("unified diff treats absolute source and destination paths as prefixed patc
 test("read reaches lines beyond the former 2 MiB prefix and returns a usable continuation", async () => {
 	const { directory, environment, context } = await fixture();
 	const path = join(directory, "large.txt");
-	await writeFile(path, "prefix content\n".repeat(180000) + "BEYOND_PREFIX\nSECOND_PAGE\n");
+	await writeFile(path, `${"prefix content\n".repeat(180000)}BEYOND_PREFIX\nSECOND_PAGE\n`);
 	const reader = createFileTools(environment).find((tool) => tool.name === "read")!;
 	const first = await reader.execute({ path, offset: 180001, limit: 1 }, context);
 	expect(first.isError).not.toBe(true);
@@ -279,7 +279,7 @@ class LegacyConnection(sqlite3.Connection):
  setlimit=None
  getlimit=None
 sqlite3.connect=lambda *args,**kwargs: _connect(*args,factory=LegacyConnection,**kwargs)
-` + argv[2],
+${argv[2]}`,
 						...argv.slice(3),
 					]
 				: argv,
@@ -396,4 +396,41 @@ test("grep falls back to PCRE2 and pages results past the previous match cap", a
 	const recovered = await reader.execute({ path: details(page).artifact, offset: 2205, limit: 1 }, context);
 	expect(recovered.isError).not.toBe(true);
 	expect(recovered.text).toContain("prefix_2204");
+});
+
+test("grep and glob apply path globs, negations and braces relative to the searched directory", async () => {
+	const { directory, environment, context } = await fixture();
+	for (const path of [
+		"pkg/src/ui/App.tsx",
+		"pkg/src/core.ts",
+		"pkg/test/core.test.ts",
+		"pkg/docs/notes.md",
+	]) {
+		await mkdir(join(directory, path, ".."), { recursive: true });
+		await writeFile(join(directory, path), "needle\n");
+	}
+	const tools = createSearchTools(environment);
+	const call = (name: string, args: Record<string, unknown>) =>
+		tools.find((tool) => tool.name === name)!.execute(args, context);
+	const lines = (output: ToolOutput) => output.text.split("\n").slice(1).sort();
+
+	const negated = await call("grep", {
+		path: "pkg/src",
+		pattern: "needle",
+		mode: "files",
+		glob: "!ui/App.tsx",
+	});
+	expect(lines(negated)).toEqual(["pkg/src/core.ts"]);
+
+	const braces = await call("grep", { path: "pkg", pattern: "needle", mode: "count", glob: "{src,test}/**" });
+	expect(lines(braces)).toEqual(["pkg/src/core.ts:1", "pkg/src/ui/App.tsx:1", "pkg/test/core.test.ts:1"]);
+
+	const content = await call("grep", { path: "pkg", pattern: "needle", glob: "docs/*.md" });
+	expect(lines(content)).toEqual(["pkg/docs/notes.md:1: needle"]);
+
+	const globbed = await call("glob", { path: "pkg", pattern: "{src,test}/**/*.ts" });
+	expect(lines(globbed)).toEqual(["pkg/src/core.ts", "pkg/test/core.test.ts"]);
+
+	const file = await call("grep", { path: "pkg/src/core.ts", pattern: "needle", mode: "files" });
+	expect(lines(file)).toEqual(["pkg/src/core.ts"]);
 });

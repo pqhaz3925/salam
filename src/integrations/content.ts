@@ -117,7 +117,7 @@ export function convertMcpContent(
 			continue;
 		}
 		if (type === "resource") {
-			const resource = block["resource"];
+			const resource = block.resource;
 			if (resource && typeof resource === "object") {
 				pushResource(resource as McpBlock, pushText, pushImage);
 				continue;

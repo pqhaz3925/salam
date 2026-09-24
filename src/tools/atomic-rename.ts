@@ -1,6 +1,6 @@
+import { dlopen, read } from "bun:ffi";
 import { Buffer } from "node:buffer";
 import { getSystemErrorName } from "node:util";
-import { dlopen, read } from "bun:ffi";
 import { ToolFailure } from "./util.ts";
 
 type Rename = (from: string, to: string, exchange: boolean) => void;

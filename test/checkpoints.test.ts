@@ -1,20 +1,18 @@
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { HistoryEntry, ModelChoice, ModelContext, RewindPoint, ToolContext } from "../src/contracts.ts";
 import { FileCheckpoints } from "../src/runtime/checkpoints.ts";
 import { type SessionRecord, Store } from "../src/runtime/store.ts";
 import { atomicRename } from "../src/tools/atomic-rename.ts";
 import { LocalExecutor } from "../src/tools/exec.ts";
-import { LocalFs } from "../src/tools/fs.ts";
 import { createFileOperationTools } from "../src/tools/file-ops.ts";
-import { FreshnessTracker, type ToolEnvironment } from "../src/tools/workspace.ts";
-import { Workspace } from "../src/tools/workspace.ts";
-import { sha256Hex } from "../src/tools/util.ts";
-import { ToolFailure } from "../src/tools/util.ts";
+import { LocalFs } from "../src/tools/fs.ts";
+import { sha256Hex, ToolFailure } from "../src/tools/util.ts";
+import { FreshnessTracker, type ToolEnvironment, Workspace } from "../src/tools/workspace.ts";
 
 /**
  * Rewind is the one feature in the harness that deletes work on purpose, so the
@@ -475,7 +473,7 @@ test("forking after a compaction keeps a valid prefix and leaves the original in
 
 	// The session that was rewound away from keeps every entry it ever had.
 	expect(store.history(session.id)).toHaveLength(5);
-	expect(store.get(session.id)?.contexts[0]!.compactionId).toBe(compaction.id);
+	expect(store.get(session.id)!.contexts[0]!.compactionId).toBe(compaction.id);
 
 	// The point that survived the cut is still offered in the branch.
 	const points = store.checkpoints(fork.id);

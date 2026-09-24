@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TreeSitterClient, addDefaultParsers, infoStringToFiletype } from "@opentui/core";
+import { addDefaultParsers, infoStringToFiletype, TreeSitterClient } from "@opentui/core";
 import type { TodoItem, UserQuestion } from "../src/contracts.ts";
 import { describeCopy } from "../src/ui/clipboard.ts";
 import { diffFenceHighlights } from "../src/ui/diff.ts";

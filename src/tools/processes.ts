@@ -1,3 +1,4 @@
+import { dlopen } from "bun:ffi";
 import {
 	closeSync,
 	fsyncSync,
@@ -6,17 +7,17 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { dlopen } from "bun:ffi";
 import type { RemoteTarget } from "../contracts.ts";
 import type { ArtifactStore } from "./artifacts.ts";
-import { LocalExecutor, type Executor, type ExecResult } from "./exec.ts";
+import { type ExecResult, type Executor, LocalExecutor } from "./exec.ts";
 import { RemoteExecutor } from "./ssh.ts";
-import { SupervisedCommand, type CommandInput, type TerminalScreen } from "./supervised-command.ts";
+import { type CommandInput, SupervisedCommand, type TerminalScreen } from "./supervised-command.ts";
 import { randomToken, ToolFailure } from "./util.ts";
 
 export type ProcessState = "running" | "exited" | "cancelled" | "failed";
@@ -40,6 +41,33 @@ export interface ProcessInfo {
 	terminationConfirmed?: boolean;
 	interactive?: boolean;
 	pty?: boolean;
+	/** Ended because someone asked it to (command_stop, /kill, shutdown), not on its own. */
+	stopRequested?: boolean;
+}
+
+/** What a watch observes on a background command; see `ProcessManager.watch`. */
+export interface WatchSpec {
+	/** JavaScript regex (Unicode) tested against each complete output line. */
+	log?: string;
+	/** Report the command ending. A pending log watch always reports an exit that preempts it. */
+	exit: boolean;
+	/** Keep reporting later matching lines instead of stopping after the first. */
+	repeat: boolean;
+	/** Output position to start from; lines before it are never tested. */
+	cursor: number;
+}
+
+export interface WatchEvent {
+	job: ProcessInfo;
+	kind: "log" | "exit";
+	/** Matching lines for `log`; the last lines of output for `exit`. */
+	lines: string[];
+	/** Output end at the time of the event, for command_output. */
+	cursor: number;
+	/** True when the log pattern was still unmatched when the command ended. */
+	unmatched?: boolean;
+	/** The watched log pattern, when there is one. */
+	pattern?: string;
 }
 
 export interface ProcessOutput {
@@ -90,6 +118,13 @@ export interface ProcessManager {
 	 * that already exited or are being torn down finish where they are.
 	 */
 	promote(owner: ProcessOwner): ProcessInfo[];
+	/**
+	 * Observes a job without blocking anyone: `onEvent` fires when a complete
+	 * output line matches `spec.log` (once, or throttled when repeating) and
+	 * when the job ends on its own. An explicit stop reports nothing. The watch
+	 * ends by itself after its last possible event; `cancel` ends it early.
+	 */
+	watch(id: string, spec: WatchSpec, onEvent: (event: WatchEvent) => void): { cancel(): void };
 }
 
 export interface ReadinessCondition {
@@ -143,12 +178,17 @@ export interface ForegroundRequest extends StartRequest {
 	keepDeadline: boolean;
 	/** Live output while in the foreground; never called once promoted. */
 	onOutput(chunk: string): void;
+	/**
+	 * Moves the command to the background after this long instead of letting a deadline
+	 * kill it, so long work and its output survive (as Ctrl+B would, but on a timer).
+	 */
+	promoteAfterMs?: number;
 }
 
 /** How a foreground run ended: its command exited, or it became a background job. */
 export type ForegroundOutcome =
 	| { promoted: false; result: ExecResult }
-	| { promoted: true; job: ProcessInfo };
+	| { promoted: true; job: ProcessInfo; reason: "user" | "timeout" };
 
 /** Concurrently running background jobs across every session. */
 const MAX_RUNNING = 16;
@@ -193,6 +233,26 @@ function acquireLease(path: string, create = true): number | undefined {
 	return undefined;
 }
 
+/**
+ * How often a watch reads new output: at first every second, backing off
+ * while the command is quiet up to a local or (each poll being an SSH round
+ * trip) remote ceiling, and back to a second as soon as output flows. An exit
+ * is observed at once either way; only log matches wait for a poll.
+ */
+const WATCH_POLL_MS = 1_000;
+const WATCH_POLL_MAX_LOCAL_MS = 3_000;
+const WATCH_POLL_MAX_REMOTE_MS = 10_000;
+/** A repeating watch reports at most this often, batching the lines between. */
+const WATCH_REPEAT_MS = 10_000;
+/** Bounds on what one watch event carries into the conversation. */
+const WATCH_MAX_LINES = 20;
+const WATCH_TAIL_LINES = 15;
+const WATCH_LINE_CHARS = 400;
+
+function clipLine(line: string): string {
+	return line.length > WATCH_LINE_CHARS ? `${line.slice(0, WATCH_LINE_CHARS - 1)}…` : line;
+}
+
 /** Compact durations for status lines: `9s`, `3m`, `3m20s`. */
 function humanDuration(ms: number): string {
 	const seconds = Math.round(ms / 1000);
@@ -219,8 +279,10 @@ class Job {
 	/** Why it ended, when an exit code alone would misrepresent it. */
 	note: string | undefined;
 	private readonly waiters = new Set<() => void>();
+	/** Runs over SSH: every output poll is a round trip. */
+	readonly remote: boolean;
 	running: SupervisedCommand | undefined;
-	private stopRequested = false;
+	stopRequested = false;
 	terminationConfirmed: boolean | undefined;
 	private stopping: Promise<void> | undefined;
 
@@ -237,6 +299,7 @@ class Job {
 		this.command = request.command;
 		this.cwd = request.cwd;
 		this.target = request.target;
+		this.remote = request.executor.remote !== undefined;
 		this.sessionId = request.sessionId;
 		this.agentId = request.agentId;
 		this.timeoutMs = timeoutMs;
@@ -258,6 +321,7 @@ class Job {
 			...(this.endedAt === undefined ? {} : { endedAt: this.endedAt }),
 			...(this.note === undefined ? {} : { note: this.note }),
 			...(this.terminationConfirmed === undefined ? {} : { terminationConfirmed: this.terminationConfirmed }),
+			...(this.stopRequested ? { stopRequested: true } : {}),
 		};
 	}
 
@@ -385,6 +449,7 @@ export class ProcessRegistry implements ProcessManager {
 	private recovery: Promise<ProcessInfo[]> | undefined;
 	private readonly leases = new Map<string, number>();
 	private readonly cleanups = new Set<Promise<void>>();
+	private readonly watches = new Set<AbortController>();
 
 	constructor(
 		private readonly artifacts: ArtifactStore,
@@ -470,12 +535,51 @@ export class ProcessRegistry implements ProcessManager {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
+		this.saveWatch(job.id, undefined);
 		try {
 			unlinkSync(join(this.stateDirectory, `${job.id}.lease`));
 		} catch {
 			/* Already absent. */
 		}
 		this.releaseLease(job.id);
+	}
+
+	/**
+	 * Records (or with `undefined`, forgets) a job's watch beside its recovery
+	 * record, so a restarted host re-arms it. Only the lease holder writes.
+	 */
+	saveWatch(id: string, spec: WatchSpec | undefined): void {
+		if (!this.leases.has(id)) return;
+		const path = join(this.stateDirectory, `${id}.watch.json`);
+		if (!spec) {
+			try {
+				unlinkSync(path);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			return;
+		}
+		const temporary = `${path}.${randomToken()}.tmp`;
+		writeFileSync(temporary, JSON.stringify({ version: 1, spec }), { mode: 0o600 });
+		renameSync(temporary, path);
+	}
+
+	/** Watches saved for jobs this registry now owns, e.g. after `recover`. */
+	savedWatches(): { id: string; spec: WatchSpec }[] {
+		const found: { id: string; spec: WatchSpec }[] = [];
+		for (const id of this.jobs.keys()) {
+			if (!this.leases.has(id)) continue;
+			try {
+				const saved = JSON.parse(readFileSync(join(this.stateDirectory, `${id}.watch.json`), "utf8")) as {
+					version?: number;
+					spec?: WatchSpec;
+				};
+				if (saved.version === 1 && saved.spec) found.push({ id, spec: saved.spec });
+			} catch {
+				/* No watch, or an unreadable one: nothing to re-arm. */
+			}
+		}
+		return found;
 	}
 
 	private cleanAfterCompletion(job: Job, command: SupervisedCommand): void {
@@ -581,17 +685,23 @@ export class ProcessRegistry implements ProcessManager {
 		// Exit and promotion are decided on one thread: whichever comes first
 		// takes the command, and `detach` refuses once it has closed or is being
 		// torn down, so the other side never also claims it.
-		this.foreground.set(job, () => {
+		const promote = (reason: "user" | "timeout") => {
 			if (this.closed || !command.detach(request.keepDeadline)) return undefined;
+			clearTimeout(timer);
 			inForeground = false;
 			this.foreground.delete(job);
 			this.evict();
 			this.jobs.set(job.id, job);
 			const info = job.info();
-			resolve({ promoted: true, job: info });
+			resolve({ promoted: true, job: info, reason });
 			return info;
-		});
+		};
+		this.foreground.set(job, () => promote("user"));
+		const timer = request.promoteAfterMs
+			? setTimeout(() => promote("timeout"), request.promoteAfterMs)
+			: undefined;
 		void command.done.then((result) => {
+			clearTimeout(timer);
 			if (!inForeground) return;
 			this.foreground.delete(job);
 			if (result.terminationConfirmed === false) {
@@ -699,9 +809,99 @@ export class ProcessRegistry implements ProcessManager {
 		);
 	}
 
+	watch(id: string, spec: WatchSpec, onEvent: (event: WatchEvent) => void): { cancel(): void } {
+		const job = this.require(id);
+		if (!job.running) throw new ToolFailure("Command output is unavailable.");
+		let pattern: RegExp | undefined;
+		try {
+			if (spec.log) pattern = new RegExp(spec.log, "u");
+		} catch (error) {
+			throw new ToolFailure(`Invalid watch regex: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (!pattern && !spec.exit) throw new ToolFailure("A watch needs a log pattern and/or exit.");
+		const stop = new AbortController();
+		this.watches.add(stop);
+		const running = job.running;
+		void (async () => {
+			let cursor = spec.cursor;
+			let partial = "";
+			let pending: string[] = [];
+			let lastFired = 0;
+			let matched = false;
+			let poll = WATCH_POLL_MS;
+			const pollCeiling = job.remote ? WATCH_POLL_MAX_REMOTE_MS : WATCH_POLL_MAX_LOCAL_MS;
+			const recent: string[] = [];
+			const remember = (line: string) => {
+				recent.push(line);
+				if (recent.length > WATCH_TAIL_LINES) recent.shift();
+			};
+			const test = (line: string) => {
+				remember(line);
+				if (!pattern || (matched && !spec.repeat)) return;
+				pattern.lastIndex = 0;
+				if (!pattern.test(line)) return;
+				if (pending.length < WATCH_MAX_LINES) pending.push(clipLine(line));
+				matched = true;
+			};
+			const flush = (force: boolean) => {
+				if (!pending.length || stop.signal.aborted || this.closed) return;
+				if (!force && spec.repeat && lastFired && Date.now() - lastFired < WATCH_REPEAT_MS) return;
+				onEvent({ job: job.info(), kind: "log", lines: pending, cursor, pattern: spec.log });
+				pending = [];
+				lastFired = Date.now();
+			};
+			try {
+				for (;;) {
+					if (stop.signal.aborted || this.closed) return;
+					const ended = job.state !== "running";
+					const before = cursor;
+					const snapshot = await running.output(cursor);
+					// Cancelled while the read was in flight: report nothing it returned.
+					if (stop.signal.aborted || this.closed) return;
+					const from = Math.max(cursor, snapshot.start);
+					const text = snapshot.chunks
+						.filter((chunk) => chunk.end > from)
+						.map((chunk) => chunk.text.slice(Math.max(0, from - chunk.start)))
+						.join("");
+					cursor = snapshot.cursor;
+					const lines = (partial + text).split(/\r?\n/);
+					partial = lines.pop() ?? "";
+					for (const line of lines) test(line);
+					if (ended) {
+						if (partial) test(partial);
+						flush(true);
+						const info = job.info();
+						const unmatched = Boolean(pattern) && !matched;
+						if (!info.stopRequested && (spec.exit || unmatched) && !stop.signal.aborted && !this.closed)
+							onEvent({
+								job: info,
+								kind: "exit",
+								lines: recent.map(clipLine),
+								cursor,
+								...(unmatched ? { unmatched } : {}),
+								...(spec.log ? { pattern: spec.log } : {}),
+							});
+						return;
+					}
+					flush(false);
+					// A one-shot log watch without exit reporting is finished once it fired.
+					if (matched && !spec.repeat && !spec.exit && !pending.length) return;
+					poll = snapshot.cursor > before ? WATCH_POLL_MS : Math.min(poll * 2, pollCeiling);
+					await job.settle(poll, stop.signal);
+				}
+			} catch {
+				/* Output became unavailable (evicted or shut down); the watch simply ends. */
+			} finally {
+				this.watches.delete(stop);
+			}
+		})();
+		return { cancel: () => stop.abort() };
+	}
+
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		for (const watch of this.watches) watch.abort();
 		// Termination has to finish before the executors do: an SSH job is killed
 		// over the same ControlMaster the workspace is about to tear down.
 		const pending: Promise<void>[] = [];

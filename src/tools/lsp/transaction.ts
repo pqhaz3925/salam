@@ -4,7 +4,7 @@ import type { ToolContext } from "../../contracts.ts";
 import { mutationPublication } from "../atomic-io.ts";
 import { sha256Hex, ToolFailure } from "../util.ts";
 import type { ToolEnvironment, Workspace } from "../workspace.ts";
-import type { TextEdit, WorkspaceEdit, DocumentChange } from "./client.ts";
+import type { DocumentChange, TextEdit, WorkspaceEdit } from "./client.ts";
 import { uriToPath } from "./manager.ts";
 
 export interface FileVersion {

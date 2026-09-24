@@ -83,9 +83,12 @@ export interface SalamConfig {
 	mcpServers: Record<string, McpServerConfig>;
 	remotes: Record<string, RemoteTarget>;
 	maxTurns: number;
+	/** Generate session titles with the session's model from the first message (default true). */
+	autoTitle?: boolean;
 	maxAgents: number;
 	maxOutputTokens: number;
-	contextThreshold: number;
+	/** Optional token cap; absent uses the active model's context budget. */
+	contextThreshold?: number;
 	reasoning: (typeof REASONING_LEVELS)[number];
 	/** Claude Code-style file auto memory; absent means enabled. */
 	autoMemoryEnabled?: boolean;
@@ -93,6 +96,12 @@ export interface SalamConfig {
 	autoMemoryDirectory?: string;
 	/** Settings source for persistent /memory toggles; defaults to the user config. */
 	autoMemorySettingsPath?: string;
+	/**
+	 * Tools the model is offered (`--tools`/`--lean`); absent offers every tool. A restricted
+	 * set also swaps in a system prompt that names no tool outside it, so a benchmark measures the
+	 * tool set rather than leftover guidance.
+	 */
+	tools?: string[];
 }
 export type HistoryEntry = { origin?: ModelChoice } & (
 	| { id: string; kind: "message"; message: Message }
@@ -157,7 +166,11 @@ export interface ProviderUsage {
 	unavailable?: string;
 }
 export interface ProviderGateway {
-	models(): Promise<ModelChoice[]>;
+	/**
+	 * provider limits the listing to one configured provider; offline skips live account
+	 * discovery (Codex/Devin network requests) and lists only the bundled/configured catalog.
+	 */
+	models(options?: { provider?: string; offline?: boolean }): Promise<ModelChoice[]>;
 	stream(request: ProviderRequest): AsyncIterable<ProviderEvent>;
 	webFetch(request: {
 		selection: ModelChoice;
@@ -187,6 +200,8 @@ export interface ProviderGateway {
 }
 export interface IntegrationServices {
 	tools: HarnessTool[];
+	/** Resolves once background startup (MCP connections) has settled; instructions are then complete. */
+	ready?(): Promise<void>;
 	instructions(cwd: string): Promise<string[]>;
 	skills(): Promise<{ name: string; description: string; source: string }[]>;
 	loadSkill(name: string): Promise<string>;
@@ -234,8 +249,30 @@ export interface RewindPoint {
 	filesAvailable: boolean;
 	selection?: ModelChoice;
 }
+/** An image the user attached to a message (pasted or dropped into the composer). */
+export interface ImageAttachment {
+	/** Base64 of the encoded image. */
+	data: string;
+	mimeType: string;
+}
+/** One subscription window in the footer: what is left of it and when it resets. */
+export interface QuotaWindow {
+	/** Short window name: `5h`, `day`, `week`. */
+	label: string;
+	/** Fraction of the window still available, 0..1. */
+	remaining: number;
+	resetsAt?: number;
+}
+/** The active model's account quota, as last fetched from its provider. */
+export interface QuotaView {
+	provider: string;
+	windows: QuotaWindow[];
+	fetchedAt: number;
+}
 export interface AppSnapshot {
 	sessionId: string;
+	/** Session title: /title, else model-generated, else the first message. */
+	title?: string;
 	inputMode?: "text" | "secret";
 	selection: ModelChoice;
 	reasoning: SalamConfig["reasoning"];
@@ -252,6 +289,8 @@ export interface AppSnapshot {
 	usage: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "totalTokens">;
 	contextTokens: number;
 	contextLimit: number;
+	/** Subscription quota of the active provider (Claude, Codex, Devin); absent when unknown. */
+	quota?: QuotaView;
 	status: string;
 }
 export type RuntimeEvent =
@@ -263,10 +302,12 @@ export type SubmissionMode = "steer" | "interrupt";
 export interface AppController {
 	snapshot(): AppSnapshot;
 	subscribe(listener: (event: RuntimeEvent) => void): () => void;
-	submit(text: string, mode?: SubmissionMode): Promise<void>;
+	submit(text: string, mode?: SubmissionMode, images?: ImageAttachment[]): Promise<void>;
 	answerQuestion(id: string, answers: Record<string, string | string[]>): Promise<void>;
 	command(line: string): Promise<void>;
 	cancel(): void;
+	/** Interrupts the running work and sends queued messages now; a plain cancel when none are queued. */
+	sendQueued(): Promise<void>;
 	background(): boolean;
 	models(): Promise<ModelChoice[]>;
 	sessions(): SessionInfo[];

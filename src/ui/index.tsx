@@ -1,7 +1,7 @@
-import { CliRenderEvents, addDefaultParsers, createCliRenderer } from "@opentui/core";
 import type { CliRenderer, CliRendererErrorEvent, KeyEvent } from "@opentui/core";
+import { addDefaultParsers, CliRenderEvents, createCliRenderer } from "@opentui/core";
 import { render, useKeyboard } from "@opentui/solid";
-import { ErrorBoundary, createSignal } from "solid-js";
+import { createSignal, ErrorBoundary } from "solid-js";
 import type { AppController, AppSnapshot } from "../contracts.ts";
 import { App } from "./App.tsx";
 import { createSelectionCopier } from "./clipboard.ts";
@@ -85,10 +85,21 @@ export async function startUI(
 	);
 	for (const [signal, handler] of signalHandlers) process.on(signal, handler);
 
+	// The terminal window/tab shows the dialog title; only rewritten when it changes.
+	let shownTitle: string | undefined;
+	const showTitle = (next: AppSnapshot) => {
+		const title = next.title && next.title !== "New session" ? `salam · ${next.title}` : "salam";
+		if (title === shownTitle || renderer.isDestroyed) return;
+		shownTitle = title;
+		renderer.setTerminalTitle(title.replace(/\p{Cc}/gu, " "));
+	};
+	showTitle(snapshot());
 	const publish = () => {
 		pending = undefined;
 		if (finished) return;
-		setSnapshot(controller.snapshot());
+		const next = controller.snapshot();
+		showTitle(next);
+		setSnapshot(next);
 	};
 
 	const exit = () => {
@@ -145,6 +156,7 @@ export async function startUI(
 						home={home}
 						exit={exit}
 						copy={copier.copy}
+						readClipboard={copier.read}
 					/>
 				</ErrorBoundary>
 			),

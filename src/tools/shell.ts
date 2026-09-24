@@ -1,5 +1,11 @@
 import type { Arguments, HarnessTool, Json, ToolContext, ToolOutput } from "../contracts.ts";
-import type { ProcessInfo, ProcessOutput, ReadinessCondition } from "./processes.ts";
+import type { BoundedText } from "./artifacts.ts";
+import { reportExternalChanges } from "./fs.ts";
+import type { ProcessInfo, ProcessOutput, ReadinessCondition, WatchEvent } from "./processes.ts";
+import { SeenFileChanges } from "./shell-changes.ts";
+import { classifyShell } from "./shell-kind.ts";
+import { GREP_VALUE_FLAGS, words } from "./shell-words.ts";
+import { SYNTAX_ERRORS, syntaxRegressions } from "./syntax-check.ts";
 import { argBool, argInt, argOptionalString, argString, EmitThrottle, ToolFailure } from "./util.ts";
 import { defineTool, displayPath, type ToolEnvironment } from "./workspace.ts";
 
@@ -63,6 +69,121 @@ function readiness(args: Arguments): (ReadinessCondition & { timeout: number }) 
 	};
 }
 
+/** A single foreground `sleep` at or above this is refused as a wait. */
+const SLEEP_REFUSAL_SECONDS = 10;
+const SLEEP_UNITS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3600, d: 86_400 };
+
+/**
+ * The longest literal `sleep` duration in a command line, in seconds (0 when
+ * there is none). `sleep 1m 30s` sums its operands as coreutils does.
+ */
+export function longestSleep(command: string): number {
+	let longest = 0;
+	for (const match of command.matchAll(
+		/(?:^|[\s;&|(`{]|\$\()sleep((?:\s+(?:\d+(?:\.\d+)?|\.\d+)[smhd]?)+)(?=$|[\s;&|)`}])/g,
+	)) {
+		let total = 0;
+		for (const operand of match[1]!.trim().split(/\s+/)) {
+			const parsed = /^(\d*\.?\d+)([smhd]?)$/.exec(operand);
+			if (parsed) total += Number(parsed[1]) * SLEEP_UNITS[parsed[2]!]!;
+		}
+		longest = Math.max(longest, total);
+	}
+	return longest;
+}
+
+const SLEEP_ADVICE =
+	"Do not sleep in the shell to wait. Start the work with shell background: true, then either block on it with command_wait (timeout, ready.log/ready.port) or call command_watch, which returns at once and wakes you when a log line matches or the command exits. For an external condition (CI, deploy, remote service), start a background polling command such as `until curl -fsS URL; do sleep 5; done` and watch its exit. If you truly need a plain timer, run `sleep N` with background: true and command_watch it.";
+
+const json = (value: Record<string, string | number>) => JSON.stringify(value);
+
+/**
+ * The native tool call a plain file-inspection command maps to, or undefined.
+ * Only a single simple command counts (optionally after `cd DIR &&`): any
+ * pipe, redirection, chaining or substitution means the shell is doing real
+ * work. The native tools number lines, page with offset/limit, report the
+ * total length and spill oversized output to a recoverable artifact, so a
+ * raw `cat`/`sed -n`/`head` or recursive `grep` only costs context.
+ */
+export function nativeEquivalent(command: string): string | undefined {
+	const line = command.trim().replace(/^cd\s+(?:'[^']*'|"[^"]*"|[^\s;&|]+)\s*&&\s*/, "");
+	if (/[|;&<>`\n]|\$\(/.test(line)) return undefined;
+	const argv = words(line);
+	if (!argv?.length) return undefined;
+	const [program, ...rest] = argv;
+	const flags = rest.filter((word) => word.startsWith("-"));
+	const operands = rest.filter((word) => !word.startsWith("-"));
+	switch (program) {
+		case "cat":
+		case "nl":
+		case "less":
+		case "more":
+			if (operands.length === 0 || flags.some((flag) => !["-n", "-b"].includes(flag))) return undefined;
+			return operands.map((path) => `read ${json({ path })}`).join(", ");
+		case "head": {
+			const count = /^-(?:n)?(\d+)$/.exec(flags.join(""))?.[1] ?? (flags.length ? undefined : "10");
+			const numeric = rest[0] === "-n" && /^\d+$/.test(rest[1] ?? "") ? rest[1] : count;
+			const paths = rest[0] === "-n" ? rest.slice(2) : operands;
+			if (!numeric || paths.length !== 1) return undefined;
+			return `read ${json({ path: paths[0]!, limit: Number(numeric) })}`;
+		}
+		case "tail": {
+			if (flags.some((flag) => /^-[fF]/.test(flag)) || operands.length === 0) return undefined;
+			const path = operands.at(-1)!;
+			return `read ${json({ path })} (its header states the total line count; pass offset to start near the end). For a growing log, use shell background: true with command_output or command_watch`;
+		}
+		case "sed": {
+			if (rest[0] !== "-n" || rest.length !== 3) return undefined;
+			const range = /^(\d+)(?:,(\d+))?p$/.exec(rest[1]!);
+			if (!range) return undefined;
+			const from = Number(range[1]);
+			const to = Number(range[2] ?? range[1]);
+			return `read ${json({ path: rest[2]!, offset: from, limit: Math.max(1, to - from + 1) })}`;
+		}
+		case "wc":
+			if (flags.join("") !== "-l" || operands.length !== 1) return undefined;
+			return `read ${json({ path: operands[0]!, limit: 1 })} (its header states the total line count)`;
+		case "grep":
+		case "egrep":
+		case "rg": {
+			// A flag taking a separate value would be misread as the pattern: leave those alone.
+			if (operands.length === 0 || flags.some((flag) => GREP_VALUE_FLAGS.has(flag))) return undefined;
+			const pattern = operands[0]!;
+			if (operands.length > 2) return undefined;
+			const path = operands[1] ?? ".";
+			const files = flags.some((flag) => /^-[a-zA-Z]*l/.test(flag) || flag === "--files-with-matches");
+			return `grep ${json({ pattern, path, ...(files ? { mode: "files" } : {}) })} (context, glob filters, case_sensitive, paging)`;
+		}
+		case "find": {
+			const name = rest.indexOf("-name");
+			const iname = rest.indexOf("-iname");
+			const at = name >= 0 ? name : iname;
+			if (at < 0 || !rest[at + 1]) return undefined;
+			const allowed = new Set(["-name", "-iname", "-type", "f", "d", rest[at + 1]!, rest[0]!]);
+			if (rest.some((word) => !allowed.has(word))) return undefined;
+			const root = rest[0]!.startsWith("-") ? "." : rest[0]!;
+			return `glob ${json({ pattern: `**/${rest[at + 1]!}`, path: root })}`;
+		}
+		default:
+			return undefined;
+	}
+}
+
+/** Human text for one watch event, delivered to the watching session as mail. */
+export function describeWatchEvent(event: WatchEvent): string {
+	const job = event.job;
+	const header = `${job.id} ${job.target}$ ${job.command.length > LIST_COMMAND_CHARS ? `${job.command.slice(0, LIST_COMMAND_CHARS - 1)}…` : job.command}`;
+	const resume = `Read on with command_output ${job.id} cursor ${event.cursor}.`;
+	if (event.kind === "log") {
+		const count = event.lines.length;
+		return `[command_watch] ${header}\n${count} line${count === 1 ? "" : "s"} matched /${event.pattern ?? ""}/ (command ${statusLabel(job)}):\n${event.lines.join("\n")}\n${resume}`;
+	}
+	const ending = `${statusLabel(job)} after ${durationSince(job.startedAt, job.endedAt)}${job.note ? ` (${job.note})` : ""}`;
+	const unmatched = event.unmatched ? ` The watched pattern /${event.pattern ?? ""}/ never matched.` : "";
+	const tail = event.lines.length ? `\nLast output:\n${event.lines.join("\n")}` : "\n(no output)";
+	return `[command_watch] ${header}\nCommand ${ending}.${unmatched}${tail}\n${resume}`;
+}
+
 function durationSince(start: number, end: number | undefined): string {
 	const seconds = Math.round(((end ?? Date.now()) - start) / 1000);
 	if (seconds < 60) return `${seconds}s`;
@@ -117,11 +238,23 @@ function renderOutput(output: ProcessOutput): ToolOutput {
 	};
 }
 
-export function createShellTool(environment: ToolEnvironment): HarnessTool {
-	return defineTool({
+/**
+ * `bare` is the shell offered by a restricted tool set (`--lean`): no refusals that point at
+ * native read/grep/glob or wait/watch tools the model does not have. With `background` it may
+ * still start managed jobs, read and stopped through command_output and command_stop;
+ * without it, it runs in the foreground only.
+ */
+export function createShellTool(
+	environment: ToolEnvironment,
+	{ bare = false, background: backgroundJobs = false } = {},
+): HarnessTool {
+	const seen = new SeenFileChanges(environment);
+	const full = defineTool({
 		name: "shell",
 		description:
 			"Run a shell command in the active workspace. When the session targets a remote host the command runs there, not locally. Output is streamed while it runs and bounded in the result. Prefer `glob`, `grep`, `read` and `edit` over ad-hoc find/grep/cat/sed — they are faster and give better structure.\n" +
+			"Never use `sleep` to wait for something: foreground sleeps of 10s or more are refused; use background + command_wait/command_watch instead.\n" +
+			"Never inspect files through the shell: a plain cat, head, tail, sed -n, wc -l, nl, grep/rg or find -name is refused with the exact read/grep/glob call to make instead (read gives numbered lines, the total line count, offset/limit paging and recoverable overflow).\n" +
 			"Set background: true for servers, builds or log tails. Set interactive: true to keep pipe stdin open, or pty: true for a real terminal (REPLs and full-screen programs); these default to background. Use command_send for text/keys/EOF/resize and command_screen for the current terminal screen. Noninteractive stdin is closed after optional stdin text. Readiness requires observed ready.log and/or ready.port. Jobs survive owner crashes via authenticated supervisors and are recovered on restart; normal shutdown stops their process trees. Do not daemonize or escape the managed process group.",
 		parameters: {
 			type: "object",
@@ -171,6 +304,16 @@ export function createShellTool(environment: ToolEnvironment): HarnessTool {
 			const background = argBool(args, "background", interactive);
 			const ready = readiness(args);
 			if (ready && !background) throw new ToolFailure("ready requires background: true.");
+			if (!background) {
+				const slept = longestSleep(command);
+				if (!bare && slept >= SLEEP_REFUSAL_SECONDS)
+					throw new ToolFailure(`Refused: this command sleeps ${slept}s in the foreground. ${SLEEP_ADVICE}`);
+				const native = bare ? undefined : nativeEquivalent(command);
+				if (native)
+					throw new ToolFailure(
+						`Refused: use the native tool instead — ${native}. It works on local and remote workspaces, numbers lines, reports the file's total length, pages with offset/limit and keeps oversized output recoverable, so there is no need for wc -l, sed -n, head or cat. Use shell only when the native tool cannot do the job (a device or /proc file, or output that needs a real pipeline).`,
+					);
+			}
 			const execution = {
 				interactive,
 				pty,
@@ -220,14 +363,27 @@ export function createShellTool(environment: ToolEnvironment): HarnessTool {
 				}
 				const deadline = timeoutSeconds > 0 ? `, deadline ${timeoutSeconds}s` : "";
 				return {
-					text: `${header}\n[started in the background on ${job.target} as ${job.id}${deadline}]\nRead it with command_output ${job.id}, block on it with command_wait ${job.id}, end it with command_stop ${job.id}.`,
+					text: `${header}\n[started in the background on ${job.target} as ${job.id}${deadline}]\n${bare ? `Read it with command_output ${job.id}, end it with command_stop ${job.id}.` : `Read it with command_output ${job.id}, block on it with command_wait ${job.id}, get woken on a log line or its exit with command_watch ${job.id}, end it with command_stop ${job.id}.`}`,
 					details: { ...jobDetails(job), background: true },
 				};
 			}
 
 			// Started through the registry so the user can promote it mid-run: the
 			// same process then becomes a background job, keeping its output.
-			const keepDeadline = args.timeout !== undefined && args.timeout !== null;
+			// With background jobs available (--lean), a command outliving its timeout moves to the
+			// background instead of being killed: long work and its output survive.
+			const promoteOnTimeout = bare && backgroundJobs && timeoutSeconds > 0;
+			const keepDeadline = !promoteOnTimeout && args.timeout !== undefined && args.timeout !== null;
+			const baseline = await seen.before(context, workspace, bare ? { text: command, cwd } : undefined);
+			// Like edit's stale-read guard: a command that may write is not run against a file that
+			// changed underneath the agent. Reads, searches, tests and the like still run.
+			if (baseline.stale?.length) {
+				const parts = classifyShell(command);
+				if (!parts || parts.some((part) => MAY_WRITE.has(part.verb)))
+					throw new ToolFailure(
+						`Refused: ${baseline.stale.map((path) => displayPath(workspace.base(context.cwd), path)).join(", ")} changed on disk since your last command that touched it, and not by you. Read it again (cat, sed -n) before changing it; nothing was run.`,
+					);
+			}
 			const stream = new EmitThrottle(context.emit);
 			const outcome = await environment.processes.run({
 				executor: workspace.executor,
@@ -237,7 +393,8 @@ export function createShellTool(environment: ToolEnvironment): HarnessTool {
 				target: workspace.label,
 				sessionId: context.sessionId,
 				agentId: context.agentId,
-				timeoutMs: timeoutSeconds * 1000,
+				timeoutMs: promoteOnTimeout ? 0 : timeoutSeconds * 1000,
+				...(promoteOnTimeout ? { promoteAfterMs: timeoutSeconds * 1000 } : {}),
 				...execution,
 				keepDeadline,
 				signal: context.signal,
@@ -254,7 +411,7 @@ export function createShellTool(environment: ToolEnvironment): HarnessTool {
 						? `still running${keepDeadline ? `, deadline ${timeoutSeconds}s from its start` : ""}`
 						: (job.note ?? statusLabel(job));
 				return {
-					text: `${header}\n${output.text.length > 0 ? output.text : "(no output yet)"}\n[moved to the background on ${job.target} by the user as ${job.id}; ${state}]\nContinue with command_output ${job.id} cursor ${output.cursor}, block on it with command_wait ${job.id} cursor ${output.cursor}, end it with command_stop ${job.id}.`,
+					text: `${header}\n${output.text.length > 0 ? output.text : "(no output yet)"}\n[moved to the background on ${job.target} ${outcome.reason === "timeout" ? `after its ${timeoutSeconds}s timeout, instead of being stopped,` : "by the user"} as ${job.id}; ${state}]\nContinue with command_output ${job.id} cursor ${output.cursor}${bare ? "" : `, block on it with command_wait ${job.id} cursor ${output.cursor}`}, end it with command_stop ${job.id}.`,
 					details: {
 						...jobDetails(job),
 						background: true,
@@ -295,8 +452,60 @@ export function createShellTool(environment: ToolEnvironment): HarnessTool {
 									: `exited with ${result.code}${result.signal ? ` (${result.signal})` : ""}`;
 
 			const failed = status !== undefined;
+			// Without `read`, the spill is only reachable as a local file (or not at all over SSH).
+			const recoverable = (text: BoundedText) =>
+				bare && text.artifact
+					? text.text.replace(
+							`read ${text.artifact}`,
+							context.remote ? "a narrower command" : `sed -n or grep on ${text.artifactPath}`,
+						)
+					: text.text;
+			const changes = await seen.after(context, workspace, baseline, bare);
+			reportExternalChanges(
+				workspace.fs,
+				changes.flatMap((change) => (change.record ? [change.record] : [])),
+			);
+			// The UI draws every diff; the model gets only edits to files that existed before and
+			// after, capped per file — a file its own command created or deleted is one line.
+			const diff = changes
+				.map((change) => change.diff)
+				.filter(Boolean)
+				.join("");
+			const modelDiff = changes
+				.filter((change) => change.diff && !change.note)
+				.map((change) => capDiff(change.diff, change.shown))
+				.join("");
+			let changed = "";
+			const broken = await syntaxRegressions(
+				changes.flatMap((change) => (change.text ? [{ shown: change.shown, ...change.text }] : [])),
+			);
+			if (broken.length > 0) changed += `\n${SYNTAX_ERRORS} ${broken.join("; ")}]`;
+			if (changes.length > 0) {
+				const listed = changes.map((change) =>
+					change.note ? `${change.shown} (${change.note})` : change.shown,
+				);
+				const shownDiff = modelDiff
+					? await environment.artifacts.bound(modelDiff, {
+							sessionId: context.sessionId,
+							label: "shell-changes",
+						})
+					: undefined;
+				changed += `\n[files you had seen changed on disk while this command ran: ${listed.join(", ")}]${shownDiff ? `\n${recoverable(shownDiff)}` : ""}`;
+				// The model now sees the new content, so a follow-up edit need not re-read it first.
+				if (!shownDiff?.clipped)
+					for (const change of changes)
+						if (change.after)
+							environment.freshness.record(
+								context,
+								workspace.id,
+								change.path,
+								change.after.hash,
+								change.after.size,
+							);
+			}
 			return {
-				text: `${header}\n${bounded.text}${failed ? `\n[command ${status}]` : ""}`,
+				text: `${header}\n${recoverable(bounded)}${failed ? `\n[command ${status}]` : ""}${changed}`,
+				...(diff ? { diff } : {}),
 				isError: failed,
 				details: {
 					workspace: workspace.label,
@@ -314,6 +523,52 @@ export function createShellTool(environment: ToolEnvironment): HarnessTool {
 			};
 		},
 	});
+	if (!bare) return full;
+	const { command, cwd, description } = full.parameters.properties as Record<string, unknown>;
+	return {
+		...full,
+		description: backgroundJobs
+			? "Run a shell command in the active workspace. When the session targets a remote host the command runs there, not locally. Output is bounded in the result. Set background: true for servers, watchers and other long-running work: it returns an id at once, command_output reads what it printed and command_stop ends it. Processes left behind by a foreground command are stopped when it exits, so do not use `&` or nohup; use background instead. A foreground command still running at its timeout is moved to the background rather than stopped. Files you name or read are tracked: the result reports what the command changed in them, with any syntax errors it introduced, and a command that may write a file changed on disk since you last touched it is refused until you read it again."
+			: "Run a shell command in the active workspace and wait for it to finish. When the session targets a remote host the command runs there, not locally. Output is bounded in the result. Processes left behind by the command are stopped when it exits.",
+		parameters: {
+			...full.parameters,
+			properties: {
+				command,
+				cwd,
+				timeout: {
+					type: "integer",
+					description: backgroundJobs
+						? `Foreground: seconds (${DEFAULT_TIMEOUT_SECONDS} by default, ${MAX_TIMEOUT_SECONDS} at most) before a still-running command moves to the background. Background: seconds before it is stopped; no deadline by default.`
+						: `Seconds before the process tree is terminated: ${DEFAULT_TIMEOUT_SECONDS} by default, ${MAX_TIMEOUT_SECONDS} at most.`,
+					minimum: 0,
+					maximum: backgroundJobs ? MAX_BACKGROUND_TIMEOUT_SECONDS : MAX_TIMEOUT_SECONDS,
+				},
+				...(backgroundJobs
+					? {
+							background: {
+								type: "boolean",
+								description:
+									"Start the command and return its id at once instead of waiting for it. Never for something whose output you need right now.",
+							},
+						}
+					: {}),
+				stdin: { type: "string", description: "Input written to the command, followed by EOF." },
+				description,
+			},
+		},
+	};
+}
+
+/** Labels of commands that may change the files they name; unrecognised commands count too. */
+const MAY_WRITE = new Set(["Write", "Update", "Delete", "Move", "Copy", "Create"]);
+
+/** Diff lines kept per changed file in the model's copy of a shell command's changes. */
+const DIFF_LINES_PER_FILE = 80;
+
+function capDiff(diff: string, shown: string): string {
+	const lines = diff.split("\n");
+	if (lines.length <= DIFF_LINES_PER_FILE) return diff;
+	return `${lines.slice(0, DIFF_LINES_PER_FILE).join("\n")}\n… ${lines.length - DIFF_LINES_PER_FILE} more diff lines for ${shown}\n`;
 }
 
 /**
@@ -424,6 +679,68 @@ export function createProcessTools(environment: ToolEnvironment): HarnessTool[] 
 							)
 						: await processes.wait(job.id, seconds * 1000, context.signal, cursor),
 				);
+			},
+		}),
+		defineTool({
+			name: "command_watch",
+			description:
+				"Watch a background command without blocking: returns at once, and later a message wakes you (or reaches you at your next step) when a complete output line matches `log` and/or when the command ends on its own. Use it instead of sleeping or repeated polling, then carry on with other work or end your turn. `exit` defaults to true; a log watch whose pattern never matched always reports the exit. `repeat` keeps reporting later matching lines, batched at most every 10s. One watch per command: a new call replaces it, cancel: true removes it. Stopping the command yourself reports nothing.",
+			parameters: {
+				type: "object",
+				properties: {
+					id: idProperty,
+					log: {
+						type: "string",
+						description:
+							"JavaScript regular expression (Unicode flag) tested against each complete output line.",
+					},
+					exit: {
+						type: "boolean",
+						description: "Report the command ending on its own. Defaults to true.",
+					},
+					repeat: {
+						type: "boolean",
+						description: "Keep reporting later matching lines instead of only the first. Defaults to false.",
+					},
+					cursor: {
+						...cursorProperty,
+						description:
+							"Only test output at or after this cursor (from a previous read). Omit to include all retained output, so a line printed just before the watch still counts.",
+					},
+					cancel: { type: "boolean", description: "Remove this command's watch instead of setting one." },
+				},
+				required: ["id"],
+				additionalProperties: false,
+			},
+			async run(args, context): Promise<ToolOutput> {
+				const job = owned(argString(args, "id"), context);
+				if (argBool(args, "cancel", false))
+					return {
+						text: environment.unwatchJob(job.id) ? `Stopped watching ${job.id}.` : `${job.id} had no watch.`,
+						details: { ...jobDetails(job), watching: false },
+					};
+				const log = argOptionalString(args, "log") || undefined;
+				const exit = argBool(args, "exit", true);
+				const repeat = argBool(args, "repeat", false);
+				if (!log && !exit) throw new ToolFailure("Watch for a log pattern and/or the exit.");
+				if (repeat && !log) throw new ToolFailure("repeat needs a log pattern.");
+				const cursor = argInt(args, "cursor", 0, 0, Number.MAX_SAFE_INTEGER);
+				if (job.state !== "running") {
+					// Nothing left to wait for: answer now rather than with an instant wake-up.
+					const rendered = renderOutput(await processes.read(job.id, cursor));
+					return { ...rendered, text: `${rendered.text}\n[already ${statusLabel(job)}; no watch was set]` };
+				}
+				environment.watchJob(job.id, { log, exit, repeat, cursor });
+				const what = [
+					log ? `${repeat ? "every line" : "the first line"} matching /${log}/` : "",
+					exit ? "its exit" : "",
+				]
+					.filter(Boolean)
+					.join(" and ");
+				return {
+					text: `Watching ${job.id} for ${what}. You will get a message when it happens; continue with other work or end your turn instead of waiting.`,
+					details: { ...jobDetails(job), watching: true, log: log ?? null, exit, repeat, cursor },
+				};
 			},
 		}),
 		defineTool({
