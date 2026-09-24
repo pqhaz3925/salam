@@ -4,6 +4,14 @@
   "private": true,
   "type": "module",
   "description": "A local-first coding harness with subscription providers and remote tools",
+  "homepage": "https://github.com/pqhaz3925/salam#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pqhaz3925/salam.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pqhaz3925/salam/issues"
+  },
   "bin": {
     "salam": "./bin/salam"
   },
@@ -50,5 +58,8 @@
     "bun": "1.4.1",
     "typescript": "5.9.3"
   },
-  "trustedDependencies": ["@ast-grep/cli", "bun"]
+  "trustedDependencies": [
+    "@ast-grep/cli",
+    "bun"
+  ]
 }
