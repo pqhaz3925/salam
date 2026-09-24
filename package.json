@@ -1,0 +1,54 @@
+{
+  "name": "salam",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local-first coding harness with subscription providers and remote tools",
+  "bin": {
+    "salam": "./bin/salam"
+  },
+  "exports": {
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "start": "bun --preload @opentui/solid/preload src/cli.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun scripts/build.ts",
+    "format": "biome format --write src scripts test"
+  },
+  "engines": {
+    "bun": ">=1.4.1"
+  },
+  "dependencies": {
+    "@ast-grep/cli": "0.45.3",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@oh-my-pi/pi-ai": "18.2.9",
+    "@oh-my-pi/pi-catalog": "18.2.9",
+    "@opentui/core": "0.5.12",
+    "@opentui/solid": "0.5.12",
+    "@tree-sitter-grammars/tree-sitter-toml": "0.7.0",
+    "@tree-sitter-grammars/tree-sitter-yaml": "0.7.1",
+    "ajv": "8.20.0",
+    "solid-js": "1.9.12",
+    "tree-sitter-bash": "0.25.1",
+    "tree-sitter-c": "0.24.1",
+    "tree-sitter-cpp": "0.23.4",
+    "tree-sitter-css": "0.25.0",
+    "tree-sitter-go": "0.25.0",
+    "tree-sitter-html": "0.23.2",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-json": "0.24.8",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-rust": "0.24.0",
+    "tree-sitter-typescript": "0.23.2",
+    "typescript-language-server": "6.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@types/bun": "1.4.1",
+    "bun": "1.4.1",
+    "typescript": "5.9.3"
+  },
+  "trustedDependencies": ["@ast-grep/cli", "bun"]
+}

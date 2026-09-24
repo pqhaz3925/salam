@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const runtime = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'bun.exe' : 'bun');
+if (!existsSync(runtime)) {
+  process.stderr.write('salam: dependencies are missing. Run bun install in the salam directory.\n');
+  process.exit(1);
+}
+const preload = join(root, 'node_modules', '@opentui', 'solid', 'scripts', 'preload.js');
+const child = spawn(runtime, ['--preload', preload, join(root, 'src', 'cli.ts'), ...process.argv.slice(2)], { stdio: 'inherit' });
+// Ctrl+C already reaches both processes in the foreground terminal group.
+process.on('SIGINT', () => {});
+process.on('SIGTERM', () => child.kill('SIGTERM'));
+child.on('error', error => { process.stderr.write(`salam: ${error.message}\n`); process.exitCode = 1; });
+child.on('exit', (code, signal) => { process.exitCode = code ?? (signal === 'SIGINT' ? 130 : 143); });
